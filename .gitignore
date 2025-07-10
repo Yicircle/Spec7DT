@@ -1,0 +1,29 @@
+# Files and directories to ignore in the project
+#
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test directories and files
+*test/*
+*/temp/*
+
+# Distribution / packaging
+.Python
+env/
+build
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
