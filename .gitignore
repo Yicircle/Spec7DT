@@ -7,7 +7,7 @@ __pycache__/
 
 # Test directories and files
 *test/*
-*/temp/*
+*/*/temp/*
 
 # Distribution / packaging
 .Python
