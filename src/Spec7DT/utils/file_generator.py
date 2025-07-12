@@ -4,14 +4,14 @@ import numpy as np
 
 from astropy.table import Table
 
-from .utility import useful_functions
+from .utility import Filters, useful_functions
 
 class inputGenerator:
     def __init__(self):
         pass
     
     @classmethod
-    def dataframe_generator(cls, image_set):
+    def dataframe_generator(cls, image_set, cat_type):
         input_df = pd.DataFrame(columns=['id'])
         
         for i, ((galaxy, obs, band), values) in enumerate(useful_functions.tour_nested_dict_with_keys(image_set.data)):
@@ -29,14 +29,17 @@ class inputGenerator:
             err_series = pd.Series(np.array(image_set.error[galaxy][obs][band]).flatten(), name=f"{obs}.{band}_err")
             input_df = pd.concat([input_df, err_series], axis=1)
             
-            # drop NaN values
-            float_cols = input_df.select_dtypes(include=['floating']).columns
-            input_df[float_cols] = input_df[float_cols].astype('float64')  
+        # drop NaN values
+        float_cols = input_df.select_dtypes(include=['floating']).columns
+        input_df[float_cols] = input_df[float_cols].astype('float64')  
 
             
-            input_df.loc[:, input_df.columns != 'id'] = input_df.loc[:, input_df.columns != 'id'].where(input_df.loc[:, input_df.columns != 'id'] >= 0, 0).fillna(0)
-            input_df = input_df.astype({'id': 'str'})
-            input_df = input_df[(input_df.loc[:, input_df.columns != 'id'] != 0).all(axis=1)]
+        input_df.loc[:, input_df.columns != 'id'] = input_df.loc[:, input_df.columns != 'id'].where(input_df.loc[:, input_df.columns != 'id'] >= 0, 0).fillna(0)
+        input_df = input_df.astype({'id': 'str'})
+        input_df = input_df[(input_df.loc[:, input_df.columns != 'id'] != 0).all(axis=1)]
+        
+        colnames = Filters.get_catcols(cat_type)
+        input_df.rename(columns=colnames, inplace=True)
             
         return input_df
 
@@ -78,25 +81,7 @@ print(input_df)
 input_df = input_df[(input_df.loc[:, input_df.columns != 'id'] != 0).all(axis=1)]
 
 
-band_for_cigale = {
-    'NUV': 'galex.NUV',
-    'FUV': 'galex.FUV',
-    'u': 'SDSS_u',
-    'g': 'SDSS_g',
-    'r': 'SDSS_r',
-    'i': 'SDSS_i',
-    'z': 'SDSS_z',
-    'y': 'PAN-STARRS_y',
-    'J': 'J_2mass',
-    'H': 'H_2mass',
-    'Ks': 'Ks_2mass',
-    'ch1': 'spitzer.irac.ch1',
-    'ch2': 'spitzer.irac.ch2',
-    'w1': 'WISE1',
-    'w2': 'WISE2',
-    'F657N': 'HST.UVIS1.F657N',
-    'F658N': 'HST.UVIS1.F658N',
-}
+
 band_for_galapy = {
     'u': 'SDSS.u',
     'g': 'SDSS.g',

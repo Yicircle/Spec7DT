@@ -97,7 +97,7 @@ from ..division.cutout import CutRegion
 
 from .file_generator import inputGenerator
 
-def execute_pipeline(galaxy_image_set):
+def execute_pipeline(galaxy_image_set, bin, cat_type):
     pipeline1 = ImageProcessingPipeline(galaxy_image_set)
 
     pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
@@ -112,15 +112,15 @@ def execute_pipeline(galaxy_image_set):
     pipeline2.add_step(Reddening().dered, step_name="Dereddening")
     pipeline2.add_step(Masking.adapt_mask, step_name="Masking")
     pipeline2.add_step(interpolate_sky, step_name="Interpolate Masked Region")
-    pipeline2.add_step(Bin.do_binning, config={"bin_size": 150}, step_name="Binning Image")
+    pipeline2.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
     
     pipeline2.execute()
     
     pipeline3 = ImageProcessingPipeline(galaxy_image_set)
     
-    pipeline3.add_step(CutRegion.cutout_region, config={"box_size" : (39, 70)}, step_name="Cutout Image Region")
+    pipeline3.add_step(CutRegion.cutout_region, config={"box_size" : None}, step_name="Cutout Image Region")
     
     pipeline3.execute()
     
-    input_df = inputGenerator.dataframe_generator(galaxy_image_set)
+    input_df = inputGenerator.dataframe_generator(galaxy_image_set, cat_type)
     return input_df

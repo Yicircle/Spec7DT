@@ -1,4 +1,6 @@
 import numpy as np
+import math
+from photutils.segmentation import detect_threshold, detect_sources, SourceCatalog
 
 class Filters:
     """Class to handle different photometric filters and their properties."""
@@ -22,7 +24,67 @@ class Filters:
     def get_filters(cls):
         """Return a list of all filters."""
         return cls().filters
-
+    
+    @classmethod
+    def get_catcols(cls, cat_type):
+        """Return a dictionary of given type"""
+        catcols ={"cigale": cls.cigale(cls),
+                  "eazy": cls.eazy(cls),
+                  "lephare": cls.lephare(cls),
+                  "ppxf": cls.ppxf(cls),
+                  "goyangyi": cls.goyangyi(cls)
+                  }
+        
+        return catcols[cat_type.lower()]
+    
+    
+    def cigale(self):
+        cols_cigale = {
+            'GALEX.NUV': 'galex.NUV',
+            'GALEX.FUV': 'galex.FUV',
+            'SDSS.u': 'SDSS_u',
+            'SDSS.g': 'SDSS_g',
+            'SDSS.r': 'SDSS_r',
+            'SDSS.i': 'SDSS_i',
+            'SDSS.z': 'SDSS_z',
+            'PanStarrs.y': 'PAN-STARRS_y',
+            '2MASS.J': 'J_2mass',
+            '2MASS.H': 'H_2mass',
+            '2MASS.Ks': 'Ks_2mass',
+            'Spitzer.ch1': 'spitzer.irac.ch1',
+            'Spitzer.ch2': 'spitzer.irac.ch2',
+            'WISE.w1': 'WISE1',
+            'WISE.w2': 'WISE2',
+            'WISE.w3': 'WISE3',
+            'WISE.w4': 'WISE4',
+            'F657N': 'HST.UVIS1.F657N',
+            'F658N': 'HST.UVIS1.F658N',
+        }
+        cols_cigale.update({f'{key}_err': f'{cols_cigale[key]}_err' for key in cols_cigale.keys() if '_err' not in key})
+        return cols_cigale
+    
+    def eazy(self):
+        cols_eazy = {
+            
+        }
+        return cols_eazy
+    
+    def lephare(self):
+        cols_lephare = {
+            
+        }
+        return cols_lephare
+    
+    def ppxf(self):
+        cols_ppxf = {
+            
+        }
+        return cols_ppxf
+    
+    
+    def goyangyi(self):
+        print(" ╱|、\n(˚ˎ 。7  \n |、˜〵          \n じしˍ,)ノ")
+        return self.cigale(self)
 
 class Observatories:
     """Class to handle different observatories and their properties."""
@@ -53,9 +115,23 @@ class Observatories:
     def get_observatories(cls):
         """Return a list of all observatories."""
         return cls().observatories
-    
 
 class useful_functions:
+    
+    @classmethod
+    def get_galaxy_radius(cls, image):
+        
+        threshold = detect_threshold(image, nsigma=3.0)
+
+        segm = detect_sources(image, threshold, npixels=5)
+
+        catalog = SourceCatalog(image, segm)
+        gal = max(catalog, key=lambda src: src.area)
+
+        x0, y0 = gal.xcentroid, gal.ycentroid
+        a, b = gal.semimajor_sigma.value*2, gal.semiminor_sigma.value*2
+        theta = math.radians(gal.orientation.value)
+        return x0, y0, a, b, theta
     
     @staticmethod
     def extract_values_recursive(dictionary, key):

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='Spec7DT',
-    version='0.9.7',
+    version='0.9.9',
     description='Spectral image handling package for 7-Dimensional Telescope users by Won-Hyeong Lee',
     author='Won-Hyeong Lee',
     author_email='wohy1220@gmail.com',
