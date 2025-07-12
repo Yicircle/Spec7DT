@@ -4,7 +4,7 @@ import numpy as np
 
 from astropy.table import Table
 
-from utils.utility import useful_functions
+from .utility import useful_functions
 
 class inputGenerator:
     def __init__(self):

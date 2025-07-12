@@ -86,16 +86,16 @@ class ImageProcessingPipeline:
         #     print(f"✗ {step['name']} failed for {galaxy}/{observatory}/{band}: {e}")
 
 
-from utils.unit import conversion
-from reduction.background import backgroundSubtraction
-from reduction.PSF import PointSpreadFunction
-from manipulation.reddening import Reddening
-from manipulation.mask import Masking
-from manipulation.sky_interpolate import interpolate_sky
-from division.binning import Bin
-from division.cutout import CutRegion
+from .unit import conversion
+from ..reduction.background import backgroundSubtraction
+from ..reduction.PSF import PointSpreadFunction
+from ..manipulation.reddening import Reddening
+from ..manipulation.mask import Masking
+from ..manipulation.sky_interpolate import interpolate_sky
+from ..division.binning import Bin
+from ..division.cutout import CutRegion
 
-from utils.file_generator import inputGenerator
+from .file_generator import inputGenerator
 
 def execute_pipeline(galaxy_image_set):
     pipeline1 = ImageProcessingPipeline(galaxy_image_set)

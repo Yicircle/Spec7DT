@@ -11,7 +11,7 @@ from typing import Callable, Optional, Union, List
 
 from .utility import Filters, Observatories
 from .utility import useful_functions
-from utils.file_generator import *
+from .file_generator import *
 
 
 class GalaxyImageSet():
