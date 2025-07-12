@@ -240,7 +240,7 @@ class GalaxyImageSet():
     def set_psf(self, galaxy_name, observatory, band, new_psf_value):
         self.psf[galaxy_name][observatory][band] = new_psf_value
 
-    def summary(self) -> None:
+    def summary(self):
         """Print summary of galaxies and available bands."""
         for galaxy, val in self.data.items():
             for obs, bands in val.items():

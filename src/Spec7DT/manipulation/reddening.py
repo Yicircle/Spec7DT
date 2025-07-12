@@ -35,9 +35,9 @@ class Reddening:
         
                 
     def get_resp_curve(self):
-        base_dir = Path(__file__).resolve().parents[2]
-        filter_dir = base_dir / "src" / "reference" / "filter_curves"
-        dat_path = filter_dir / f"{self.filter_file}"
+        import importlib.resources
+
+        dat_path = importlib.resources.files("Spec7DT.reference.filter_curves").joinpath(f"{self.filter_file}")
         
         f_g = np.genfromtxt(dat_path, skip_header = 3 , delimiter = ' ' , dtype = float)
         wave = f_g[:, 0]
