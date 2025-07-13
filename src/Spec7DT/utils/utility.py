@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import inspect
 from photutils.segmentation import detect_threshold, detect_sources, SourceCatalog
 
 class Filters:
@@ -26,16 +27,24 @@ class Filters:
         return cls().filters
     
     @classmethod
-    def get_catcols(cls, cat_type):
+    def get_catcols(cls, cat_type, col_names):
         """Return a dictionary of given type"""
-        catcols ={"cigale": cls.cigale(cls),
-                  "eazy": cls.eazy(cls),
-                  "lephare": cls.lephare(cls),
-                  "ppxf": cls.ppxf(cls),
-                  "goyangyi": cls.goyangyi(cls)
+        catcols ={"cigale": cls.cigale,
+                  "eazy": cls.eazy,
+                  "lephare": cls.lephare,
+                  "ppxf": cls.ppxf,
+                  "goyangyi": cls.goyangyi
                   }
         
-        return catcols[cat_type.lower()]
+        function = catcols[cat_type.lower()]
+        sig = inspect.signature(function)
+        
+        # image_data, header, error_data, galaxy_name, observatory, band, image_set
+        kwargs = {"self": cls, "col_names": col_names}
+        
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        
+        return function(*filtered_kwargs)
     
     
     def cigale(self):
@@ -63,10 +72,12 @@ class Filters:
         cols_cigale.update({f'{key}_err': f'{cols_cigale[key]}_err' for key in cols_cigale.keys() if '_err' not in key})
         return cols_cigale
     
-    def eazy(self):
-        cols_eazy = {
-            
-        }
+    def eazy(self, col_names):
+        flux_dict = {name:f"F_{name}" for name in col_names if "_err" not in name}
+        err_dict = {name:f"E_{name.strip("_err")}" for name in col_names if "_err" in name}
+        flux_dict.update(err_dict)
+        
+        cols_eazy = flux_dict
         return cols_eazy
     
     def lephare(self):
