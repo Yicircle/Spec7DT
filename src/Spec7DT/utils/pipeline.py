@@ -97,7 +97,7 @@ from ..division.cutout import CutRegion
 
 from .file_generator import inputGenerator
 
-def execute_pipeline(galaxy_image_set, bin, cat_type):
+def execute_pipeline(galaxy_image_set, cat_type, bin=1, box_size=None, cut_coeff=1.5):
     pipeline1 = ImageProcessingPipeline(galaxy_image_set)
 
     pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
@@ -118,7 +118,7 @@ def execute_pipeline(galaxy_image_set, bin, cat_type):
     
     pipeline3 = ImageProcessingPipeline(galaxy_image_set)
     
-    pipeline3.add_step(CutRegion.cutout_region, config={"box_size" : None}, step_name="Cutout Image Region")
+    pipeline3.add_step(CutRegion.cutout_region, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Cutout Image Region")
     
     pipeline3.execute()
     

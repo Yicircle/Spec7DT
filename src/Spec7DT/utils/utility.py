@@ -43,8 +43,7 @@ class Filters:
         kwargs = {"self": cls, "col_names": col_names}
         
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        
-        return function(*filtered_kwargs)
+        return function(**filtered_kwargs)
     
     
     def cigale(self):
@@ -94,8 +93,9 @@ class Filters:
     
     
     def goyangyi(self):
+        cols_cigale = self.cigale(self)
         print(" ╱|、\n(˚ˎ 。7  \n |、˜〵          \n じしˍ,)ノ")
-        return self.cigale(self)
+        return cols_cigale
 
 class Observatories:
     """Class to handle different observatories and their properties."""

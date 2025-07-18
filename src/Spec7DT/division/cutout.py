@@ -5,10 +5,10 @@ from ..utils.utility import useful_functions
 class CutRegion:
     
     @classmethod
-    def cutout_region(cls, box_size, image_data, error_data, galaxy_name, observatory, band, image_set):
+    def cutout_region(cls, box_size, image_data, error_data, galaxy_name, observatory, band, image_set, cut_coeff):
         if box_size == None or not box_size:
             x, y, a, b, th = useful_functions.get_galaxy_radius(image_data)
-            a = 1.5 * a; b = 1.5 * b
+            a = cut_coeff * a; b = cut_coeff * b
             box_size = (x, y, a, b, th)
         
         cut_img, cut_error = cls.get_cutout(image_data, error_data, box_size, 'ellipse')

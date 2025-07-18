@@ -4,10 +4,10 @@ class Bin:
     
     @classmethod
     def do_binning(cls, bin_size, image_data, error_data, galaxy_name, observatory, band, image_set):
-        # if bin_size is None:
-        #     bin_size = image_data.shape[0]
-        binned_img = cls.binning(image_data, bin_size, bin_size)
-        binned_err = cls.binning_err(error_data, bin_size, bin_size)
+        total_size = int(image_data.shape[0] // bin_size)
+        
+        binned_img = cls.binning(image_data, total_size, total_size)
+        binned_err = cls.binning_err(error_data, total_size, total_size)
         image_set.update_data(binned_img, galaxy_name, observatory, band)
         image_set.update_error(binned_err, galaxy_name, observatory, band)
         
