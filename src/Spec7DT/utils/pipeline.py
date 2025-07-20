@@ -97,28 +97,41 @@ from ..division.cutout import CutRegion
 
 from .file_generator import inputGenerator
 
-def execute_pipeline(galaxy_image_set, cat_type, bin=1, box_size=None, cut_coeff=1.5):
+def execute_pipeline(galaxy_image_set, cat_type, processes={}, bin=1, box_size=None, cut_coeff=1.5):
+    if not processes:
+        processes = {
+            "unit": True,
+            "background": False,
+            "psf": True,
+            "dered": True,
+            "mask": True,
+            "skyinter": True,
+            "bin": True,
+            "cutout": True
+        }
+    
+    
     pipeline1 = ImageProcessingPipeline(galaxy_image_set)
 
-    pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
-    # pipeline1.add_step(backgroundSubtraction)
-    pipeline1.add_step(PointSpreadFunction.extract, step_name="Extract PSF")
+    processes["unit"] and pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
+    processes["background"] and pipeline1.add_step(backgroundSubtraction) 
+    processes["psf"] and pipeline1.add_step(PointSpreadFunction.extract, step_name="Extract PSF")
     
     pipeline1.execute()
     
     pipeline2 = ImageProcessingPipeline(galaxy_image_set)
     
-    pipeline2.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
-    pipeline2.add_step(Reddening().dered, step_name="Dereddening")
-    pipeline2.add_step(Masking.adapt_mask, step_name="Masking")
-    pipeline2.add_step(interpolate_sky, step_name="Interpolate Masked Region")
-    pipeline2.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
+    processes["psf"] and pipeline2.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
+    processes["dered"] and pipeline2.add_step(Reddening().dered, step_name="Dereddening")
+    processes["mask"] and pipeline2.add_step(Masking.adapt_mask, step_name="Masking")
+    processes["skyinter"] and pipeline2.add_step(interpolate_sky, step_name="Interpolate Masked Region")
+    processes["bin"] and pipeline2.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
     
     pipeline2.execute()
     
     pipeline3 = ImageProcessingPipeline(galaxy_image_set)
     
-    pipeline3.add_step(CutRegion.cutout_region, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Cutout Image Region")
+    processes["cutout"] and pipeline3.add_step(CutRegion.cutout_region, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Cutout Image Region")
     
     pipeline3.execute()
     

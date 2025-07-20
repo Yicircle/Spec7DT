@@ -1,6 +1,8 @@
 import numpy as np
 import math
 import inspect
+import shutil
+from pathlib import Path
 from photutils.segmentation import detect_threshold, detect_sources, SourceCatalog
 
 class Filters:
@@ -20,6 +22,13 @@ class Filters:
     def _mediumband(self):
         """Return a list of mediumband filters."""
         return [f'm{wave}' for wave in range(400, 900, 25)]
+    
+    @classmethod
+    def add_filter(cls, filepath, filter_name=None):
+        filter_name = Path(filepath).stem if filter_name is None else filter_name
+        
+        shutil.copy(filepath, "../reference/filter_curves/")
+        cls().filters.append(filter_name)
     
     @classmethod
     def get_filters(cls):
@@ -112,7 +121,7 @@ class Observatories:
     
     def _infrareds(self):
         """Return a list of infrared observatories."""
-        return ['WISE', 'Spitzer', 'Herschel', 'JWST', 'VISTA', 'UKIDSS', '2MASS']
+        return ['WISE', 'Spitzer', 'Herschel', 'JWST', 'VISTA', 'UKIDSS', '2MASS', 'SPHEREx']
     
     def _ultraviolet(self):
         """Return a list of ultraviolet observatories."""
