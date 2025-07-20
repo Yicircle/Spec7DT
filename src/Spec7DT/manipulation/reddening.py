@@ -15,12 +15,16 @@ class Reddening:
     
     def dered(self, image_data, error_data, galaxy_name, observatory, band, image_set):
         self.obj, self.obs, self.filt = galaxy_name, observatory, band
-        self.filter_file = f'{self.obs}.{self.filt}.dat'
         self.ra, self.dec = Ned.query_object(self.obj)['RA', 'DEC'][0]
         coords = SkyCoord(self.ra, self.dec, unit='deg', frame='icrs')
+        
+        # Import PlanckQuery here to avoid potential import issues
+        from dustmaps.planck import PlanckQuery
         planck = PlanckQuery()
         self.ebv = planck(coords)
+        
         wave, resp = self.get_resp_curve()
+        
         # Check if filter is valid for CCM98 model
         if (max(wave) > 3.3 * 1e4) | (min(wave) < 9.1 * 1e2):
             print('Filter is not valid for CCM98 model')
@@ -35,17 +39,28 @@ class Reddening:
         
                 
     def get_resp_curve(self):
-        import importlib.resources
-
-        dat_path = importlib.resources.files("Spec7DT.reference.filter_curves").joinpath(f"{self.filter_file}")
+        """Get response curve using the Filters class."""
+        from ..utils.utility import Filters
         
-        f_g = np.genfromtxt(dat_path, skip_header = 3 , delimiter = ' ' , dtype = float)
-        wave = f_g[:, 0]
-        resp = f_g[:, 1]
-        
-        mask = (resp != 0)
-        
-        return wave[mask], resp[mask]
+        try:
+            # Try to get filter curve using observatory and band
+            curve = Filters.get_filter_curve(self.filt, observatory=self.obs)
+            
+            # Filter out zero response values
+            mask = (curve.response != 0)
+            wave = curve.wavelength[mask]
+            resp = curve.response[mask]
+            
+            print(f"Loaded filter: {curve.name} ({curve.unit_type})")
+            if curve.description:
+                print(f"Description: {curve.description}")
+            
+            return wave, resp
+            
+        except Exception as e:
+            print(f"Error loading filter '{self.obs}.{self.filt}': {e}")
+            print("Make sure the filter exists in the Filters class")
+            raise UserWarning("Filter Existance Warning")
     
     def reddening_ccm(self, wave, ebv=None, a_v=None, r_v=3.1, model='ccm89'):
         """

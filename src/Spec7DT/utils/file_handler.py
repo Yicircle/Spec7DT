@@ -40,10 +40,11 @@ class GalaxyImageSet():
 
         # Parse galaxy name, band, and observatory from the filename
         file_name = filepath.stem
+        print(file_name)
         galaxy_name = Parsers._galaxy_name_parser(file_name=file_name)
         band = Parsers._band_name_parser(file_name=file_name)
         observatory = Parsers._observatory_name_parser(file_name=file_name)
-        
+        print(galaxy_name, band, observatory)
         if galaxy_name is None or band is None or observatory is None:
             return
         
@@ -285,7 +286,7 @@ class Parsers:
         """Parse band names from a given string or list."""
         if not isinstance(file_name, str):
             raise ValueError("file_name must be a string")
-        for band in Filters.get_filters():
+        for band in Filters.get_all_filters():
             pattern = "|".join(map(re.escape, ['-', ' ', '_', '.']))
             if band in re.split(pattern, file_name):
                 return band

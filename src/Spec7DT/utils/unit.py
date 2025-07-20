@@ -10,7 +10,8 @@ class conversion:
                          'PS1': self.PanStarr1,
                          'Spitzer': self.Spitzer,
                          'WISE': self.WISE,
-                         '2MASS': self.TMASS
+                         '2MASS': self.TMASS,
+                         'SPHEREx': self.Spitzer
                          }
     
     def unitConvertor(self, image_data, header, error_data, galaxy_name, observatory, band, image_set):

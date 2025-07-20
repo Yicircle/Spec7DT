@@ -3,4 +3,4 @@ from .division import *
 from .manipulation import *
 from .reduction import *
 
-Version = "0.9.11"
+Version = "0.9.13"
