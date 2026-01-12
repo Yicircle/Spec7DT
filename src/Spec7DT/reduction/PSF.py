@@ -10,6 +10,8 @@ import warnings
 from astropy.utils.exceptions import AstropyWarning
 warnings.simplefilter('ignore', category=AstropyWarning)
 
+from ..utils.utility import useful_functions
+
 class PointSpreadFunction:
     
     def __call__(self):
@@ -19,7 +21,7 @@ class PointSpreadFunction:
     def extract(cls, image_data, header, galaxy_name, observatory, band, image_set):    
         fwhm_val = cls.measure_psf_fwhm(cls, image_data, header, threshold_sigma=15)
         
-        image_set.set_psf(galaxy_name, observatory, band, fwhm_val) # in " fwhm * pixel_scale
+        image_set.psf = (galaxy_name, observatory, band, fwhm_val) # in " fwhm * pixel_scale
     
     @classmethod
     def convolution(cls, image_data, header, error_data, galaxy_name, observatory, band, image_set):
@@ -29,10 +31,16 @@ class PointSpreadFunction:
         """
         pixel_scale = np.abs(header.get("CD1_1", 1.1e-4)) * 3600  # in "
         
-        psf_list = image_set.get_psf(galaxy_name)
+        psf_list = useful_functions.extract_values_recursive(image_set.psf, galaxy_name)
         sig_i = image_set.psf[galaxy_name][observatory][band]
         sig_t = np.max(psf_list)
+        sig_3 = np.median(psf_list) + 3 * np.std(psf_list)
+        sig_t = np.min([sig_t, sig_3])
+        
         sigma_extra = np.sqrt(sig_t**2 - sig_i**2) / pixel_scale
+        
+        if "max" not in image_set.psf[galaxy_name]:
+            image_set.psf = (galaxy_name, "max", sig_t)
         
         if sigma_extra <= 0:
             return image_data.copy()
@@ -97,7 +105,12 @@ class PointSpreadFunction:
         sources = daofind(image)
         
         if sources is None:
-            return -1.0
+            daofind = DAOStarFinder(fwhm=15.0, threshold=threshold_sigma*std/5)
+            sources = daofind(image)
+            
+            if sources is None:    
+                print("No sources detected even in lose criteria. Return -1")
+                return -1.0
         
         # Measure FWHM for each detected star
         fwhm_measurements = []
@@ -118,6 +131,13 @@ class PointSpreadFunction:
                     continue
         
         fwhm, _ = mode(fwhm_measurements, nan_policy='omit')
-        pixel_scale = np.abs(header.get("CD1_1", 1.1e-4)) * 3600  # in "
+        cd_mx = np.abs(header.get("CD1_1", 1.0)) * 3600  # in "
+        cdelt_mx = np.abs(header.get("CDELT1", 1.0)) * 3600
+        pc_mx = np.abs(header.get("PC1_1", 1.0)) * 3600
+        
+        if (cd_mx > 3000) and (cdelt_mx > 3000) and (pc_mx > 3000):
+            raise ValueError("No valid WCS matrix in header.")
+        
+        pixel_scale = min(cd_mx, cdelt_mx, pc_mx)
         
         return fwhm * pixel_scale

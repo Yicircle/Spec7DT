@@ -4,6 +4,8 @@ from astroquery.ipac.ned import Ned
 from dustmaps.planck import PlanckQuery
 from pathlib import Path
 
+from ..handlers.filter_handler import Filters
+
 class Reddening:
     def __init__(self):
         from dustmaps.config import config
@@ -11,15 +13,13 @@ class Reddening:
         
         import dustmaps.planck
         dustmaps.planck.fetch()
-        
+        self.filter_inst = Filters()
     
     def dered(self, image_data, error_data, galaxy_name, observatory, band, image_set):
         self.obj, self.obs, self.filt = galaxy_name, observatory, band
         self.ra, self.dec = Ned.query_object(self.obj)['RA', 'DEC'][0]
         coords = SkyCoord(self.ra, self.dec, unit='deg', frame='icrs')
         
-        # Import PlanckQuery here to avoid potential import issues
-        from dustmaps.planck import PlanckQuery
         planck = PlanckQuery()
         self.ebv = planck(coords)
         
@@ -38,22 +38,22 @@ class Reddening:
         image_set.update_error(deredden_err, galaxy_name, observatory, band)
         
                 
-    def get_resp_curve(self):
+    def get_resp_curve(self, verbose=False):
         """Get response curve using the Filters class."""
-        from ..utils.utility import Filters
         
         try:
             # Try to get filter curve using observatory and band
-            curve = Filters.get_filter_curve(self.filt, observatory=self.obs)
+            curve = self.filter_inst.get_filter(name=self.filt, facility=self.obs)
             
             # Filter out zero response values
             mask = (curve.response != 0)
             wave = curve.wavelength[mask]
             resp = curve.response[mask]
             
-            print(f"Loaded filter: {curve.name} ({curve.unit_type})")
-            if curve.description:
-                print(f"Description: {curve.description}")
+            if verbose:
+                print(f"Loaded filter: {curve.name} ({curve.unit_type})")
+                if curve.description:
+                    print(f"Description: {curve.description}")
             
             return wave, resp
             

@@ -1,5 +1,8 @@
 import inspect
 import numpy as np
+import matplotlib.pyplot as plt
+
+from ..plot.plot import DrawGalaxy
 
 class ImageProcessingPipeline:
     def __init__(self, galaxy_image_set):
@@ -23,14 +26,34 @@ class ImageProcessingPipeline:
         self.pipeline_steps = [step for step in self.pipeline_steps 
                               if step['name'] != step_name]
     
-    def execute(self, galaxy_filter=None, observatory_filter=None, band_filter=None):
+    def execute(self, galaxy_filter=None, observatory_filter=None, band_filter=None, plot_step=False, verbose=False):
         """파이프라인 실행"""
         # 필터 조건에 맞는 이미지들을 선택
-        targets = self._get_filtered_targets(galaxy_filter, observatory_filter, band_filter)
         
-        for galaxy, observatory, band, image, header, error in targets:
-            for step in self.pipeline_steps:
-                self._execute_step(step, galaxy, observatory, band, image, header, error)
+        for step in self.pipeline_steps:
+            targets = self._get_filtered_targets(galaxy_filter, observatory_filter, band_filter)
+            for galaxy, observatory, band, image, header, error in targets:
+                updated_image_set = self._execute_step(step, galaxy, observatory, band, image, header, error, verbose)
+                self.galaxy_image_set.data = (
+                    galaxy, observatory, band, 
+                    updated_image_set.data[galaxy][observatory][band]
+                )
+                self.galaxy_image_set.error = (
+                    galaxy, observatory, band,
+                    updated_image_set.error[galaxy][observatory][band]
+                )
+            if plot_step is not None:
+                if isinstance(plot_step, dict):
+                    if "band" in plot_step.keys():
+                        DrawGalaxy.single_galaxy(self.galaxy_image_set, 
+                                                plot_step.get("galaxy", galaxy),
+                                                plot_step.get("obs", observatory),
+                                                plot_step.get("band", band))
+                    else:
+                        DrawGalaxy.plot_galaxies(self.galaxy_image_set, galaxy, step["name"])
+                        plt.show()
+                
+        return self.galaxy_image_set
     
     def _get_filtered_targets(self, galaxy_filter, observatory_filter, band_filter):
         """필터 조건에 맞는 (galaxy, observatory, band) 조합 반환"""
@@ -60,7 +83,7 @@ class ImageProcessingPipeline:
         
         return targets
     
-    def _execute_step(self, step, galaxy, observatory, band, image, header, error):
+    def _execute_step(self, step, galaxy, observatory, band, image, header, error, verbose):
         """Execute each step"""
         function = step['function']
         config = step['config']
@@ -81,9 +104,11 @@ class ImageProcessingPipeline:
         
         # try:
         #     result = function(**filtered_kwargs)
-        #     print(f"✓ {step['name']} completed for {galaxy}/{observatory}/{band}")
+        #     print(f"✓ {step['name']} completed for {galaxy}/{observatory}/{band}") if verbose else None
         # except Exception as e:
         #     print(f"✗ {step['name']} failed for {galaxy}/{observatory}/{band}: {e}")
+        
+        return self.galaxy_image_set
 
 
 from .unit import conversion
@@ -97,12 +122,13 @@ from ..division.cutout import CutRegion
 
 from .file_generator import inputGenerator
 
-def execute_pipeline(galaxy_image_set, cat_type, processes={}, bin=1, box_size=None, cut_coeff=1.5):
+def execute_pipeline(galaxy_image_set, cat_type, processes={}, plot_step=False, verbose=False, manual_mask:dict=None, bin=1, box_size=None, cut_coeff=1.5):
     if not processes:
         processes = {
             "unit": True,
             "background": False,
             "psf": True,
+            "psfconv": True,
             "dered": True,
             "mask": True,
             "skyinter": True,
@@ -117,23 +143,29 @@ def execute_pipeline(galaxy_image_set, cat_type, processes={}, bin=1, box_size=N
     processes["background"] and pipeline1.add_step(backgroundSubtraction) 
     processes["psf"] and pipeline1.add_step(PointSpreadFunction.extract, step_name="Extract PSF")
     
-    pipeline1.execute()
+    galaxy_image_set = pipeline1.execute(plot_step=plot_step, verbose=verbose)
     
     pipeline2 = ImageProcessingPipeline(galaxy_image_set)
     
-    processes["psf"] and pipeline2.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
+    processes["psfconv"] and pipeline2.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
     processes["dered"] and pipeline2.add_step(Reddening().dered, step_name="Dereddening")
-    processes["mask"] and pipeline2.add_step(Masking.adapt_mask, step_name="Masking")
+    processes["mask"] and pipeline2.add_step(Masking.adapt_mask, config={"manual": manual_mask}, step_name="Masking")
     processes["skyinter"] and pipeline2.add_step(interpolate_sky, step_name="Interpolate Masked Region")
     processes["bin"] and pipeline2.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
     
-    pipeline2.execute()
+    galaxy_image_set = pipeline2.execute(plot_step=plot_step, verbose=verbose)
     
     pipeline3 = ImageProcessingPipeline(galaxy_image_set)
     
-    processes["cutout"] and pipeline3.add_step(CutRegion.cutout_region, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Cutout Image Region")
+    processes["cutout"] and pipeline3.add_step(CutRegion.get_shape, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Get Cutout Region")
     
-    pipeline3.execute()
+    galaxy_image_set = pipeline3.execute(plot_step=plot_step, verbose=verbose)
+    
+    pipeline4 = ImageProcessingPipeline(galaxy_image_set)
+    
+    processes["cutout"] and pipeline4.add_step(CutRegion.cutout_region, step_name="Cutout Image")
+    
+    galaxy_image_set = pipeline4.execute(plot_step=plot_step, verbose=verbose)
     
     input_df = inputGenerator.dataframe_generator(galaxy_image_set, cat_type)
     return input_df

@@ -5,17 +5,26 @@ from ..utils.utility import useful_functions
 class CutRegion:
     
     @classmethod
-    def cutout_region(cls, box_size, image_data, error_data, galaxy_name, observatory, band, image_set, cut_coeff):
-        if box_size == None or not box_size:
+    def get_shape(cls, box_size, image_data, galaxy_name, observatory, band, image_set, cut_coeff):
+        if (box_size is None) or (not box_size):
             x, y, a, b, th = useful_functions.get_galaxy_radius(image_data)
             a = cut_coeff * a; b = cut_coeff * b
             box_size = (x, y, a, b, th)
+            
+        image_set.cutout_shape = (galaxy_name, observatory, band, box_size)
+    
+    @classmethod
+    def cutout_region(cls, image_data, error_data, galaxy_name, observatory, band, image_set):
+        cuts = useful_functions.extract_values_recursive(image_set.cutout_shape, galaxy_name)
+        print(cuts)
+        box_size = np.median(np.array(cuts), axis=0)
         
-        cut_img, cut_error = cls.get_cutout(image_data, error_data, box_size, 'ellipse')
+        cut_img, cut_error = cls.get_cutout_image(image_data, error_data, box_size, 'ellipse')
         image_set.update_data(cut_img, galaxy_name, observatory, band)
         image_set.update_error(cut_error, galaxy_name, observatory, band)
+    
 
-    def get_cutout(img, error, size, _shape: str='box'):
+    def get_cutout_image(img, error, size, _shape: str='box'):
         """
         Mask out everything except a central region of shape 'box', 'circle', or 'ellipse'.
 

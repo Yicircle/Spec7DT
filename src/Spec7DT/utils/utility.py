@@ -5,399 +5,10 @@ import shutil
 from pathlib import Path
 from typing import Union, Tuple, Dict, List, Optional
 from dataclasses import dataclass
-from importlib import resources
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 from photutils.segmentation import detect_threshold, detect_sources, SourceCatalog
 
-
-@dataclass
-class FilterCurve:
-    """Container for filter response curve data."""
-    name: str
-    wavelength: np.ndarray
-    response: np.ndarray
-    source_type: str  # 'default', 'file', 'array'
-    source_path: Optional[str] = None
-    unit_type: str = 'photon'  # 'photon' or 'energy'
-    description: str = ''
-    
-    def __post_init__(self):
-        """Validate and convert arrays to numpy."""
-        self.wavelength = np.asarray(self.wavelength)
-        self.response = np.asarray(self.response)
-        
-        if len(self.wavelength) != len(self.response):
-            raise ValueError("Wavelength and response arrays must have same length")
-    
-    def save_to_file(self, filepath: Union[str, Path]):
-        """Save filter curve to ASCII .dat file with proper header format."""
-        filepath = Path(filepath)
-        
-        # Create header lines
-        header_lines = [
-            f"# {self.name}",
-            f"# {self.unit_type}",
-            f"# {self.description}"
-        ]
-        
-        # Write file manually to control header format exactly
-        with open(filepath, 'w') as f:
-            # Write header
-            for line in header_lines:
-                f.write(line + '\n')
-            
-            # Write data
-            for wl, resp in zip(self.wavelength, self.response):
-                f.write(f"{wl:.3f} {resp:.3f}\n")
-
-class Filters:
-    """Class to handle different photometric filters and their properties."""
-    
-    # Default filter names (curves loaded lazily)
-    _default_broadband = [
-        'FUV', 'NUV', 'u', 'g', 'r', 'i', 'z', 'Y', 'J', 'H', 'Ks',
-        'w1', 'w2', 'w3', 'w4'
-    ]
-    _default_mediumband = [f'm{wave}' for wave in range(400, 900, 25)]
-    
-    # Storage for loaded filter curves
-    _loaded_curves: Dict[str, FilterCurve] = {}
-    _custom_filters: Dict[str, FilterCurve] = {}
-    
-    def __init__(self):
-        """Initialize filter instance."""
-        self.broadband = self._default_broadband.copy()
-        self.mediumband = self._default_mediumband.copy()
-        self.filters = self.broadband + self.mediumband + list(self._custom_filters.keys())
-    
-    @classmethod
-    def _load_default_filter(cls, filter_name: str) -> FilterCurve:
-        """Load a default filter from package data."""
-        if filter_name in cls._loaded_curves:
-            return cls._loaded_curves[filter_name]
-        
-        try:
-            # Get the filter curves directory
-            filter_dir = resources.files("Spec7DT.reference.filter_curves")
-            
-            # Search for files that contain the filter name
-            matching_files = []
-            with resources.as_file(filter_dir) as dir_path:
-                if dir_path.is_dir():
-                    for file_path in dir_path.glob("*.dat"):
-                        # Check if filter_name is in the filename
-                        if f".{filter_name}." in file_path.name or file_path.stem.endswith(f".{filter_name}"):
-                            matching_files.append(file_path)
-                    
-                    # If no exact match, try looser matching
-                    if not matching_files:
-                        for file_path in dir_path.glob("*.dat"):
-                            if filter_name in file_path.name:
-                                matching_files.append(file_path)
-            
-            if not matching_files:
-                raise FileNotFoundError(f"No filter file found containing '{filter_name}'")
-            
-            if len(matching_files) > 1:
-                file_names = [f.name for f in matching_files]
-                print(f"Warning: Multiple files found for '{filter_name}': {file_names}")
-                print(f"Using: {matching_files[0].name}")
-            
-            # Use the first matching file
-            selected_file = matching_files[0]
-            
-            # Load data and header information
-            wavelength, response, file_filter_name, unit_type, description = cls._load_file_filter(selected_file)
-                
-            curve = FilterCurve(
-                name=filter_name,  # Use requested name, not file header name
-                wavelength=wavelength,
-                response=response,
-                source_type='default',
-                source_path=str(selected_file),
-                unit_type=unit_type,
-                description=description
-            )
-            
-            cls._loaded_curves[filter_name] = curve
-            return curve
-            
-        except Exception as e:
-            raise FileNotFoundError(f"Could not load default filter '{filter_name}': {e}")
-    
-    @classmethod
-    def _load_file_filter(cls, filepath: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray, str, str, str]:
-        """Load filter data from ASCII .dat file and parse header."""
-        filepath = Path(filepath)
-        if not filepath.exists():
-            raise FileNotFoundError(f"Filter file not found: {filepath}")
-        
-        try:
-            # Read header information
-            filter_name = ""
-            unit_type = "photon"  # default
-            description = ""
-            
-            with open(filepath, 'r') as f:
-                lines = f.readlines()
-                
-            # Parse first three header lines
-            header_count = 0
-            
-            for i, line in enumerate(lines):
-                if line.startswith('#'):
-                    content = line[1:].strip()  # Remove # and whitespace
-                    if header_count == 0:
-                        filter_name = content
-                    elif header_count == 1:
-                        unit_type = content if content in ['photon', 'energy'] else 'photon'
-                    elif header_count == 2:
-                        description = content
-                    header_count += 1
-                else:
-                    break
-            
-            # Use filename stem if no filter name in header
-            if not filter_name:
-                filter_name = filepath.stem
-            
-            # Load numerical data
-            data = np.loadtxt(filepath)
-            if data.ndim != 2 or data.shape[1] != 2:
-                raise ValueError("File must contain 2 columns: wavelength and response")
-                
-            return data[:, 0], data[:, 1], filter_name, unit_type, description
-            
-        except Exception as e:
-            raise ValueError(f"Could not read filter file '{filepath}': {e}")
-    
-    @classmethod
-    def add_filter_from_file(cls, filepath: Union[str, Path], filter_name: Optional[str] = None):
-        """Add custom filter from ASCII .dat file."""
-        filepath = Path(filepath)
-        
-        wavelength, response, file_filter_name, unit_type, description = cls._load_file_filter(filepath)
-        
-        # Use provided name, or file header name, or filename as fallback
-        final_name = filter_name or file_filter_name or filepath.stem
-        
-        curve = FilterCurve(
-            name=final_name,
-            wavelength=wavelength,
-            response=response,
-            source_type='file',
-            source_path=str(filepath.resolve()),
-            unit_type=unit_type,
-            description=description
-        )
-        
-        cls._custom_filters[final_name] = curve
-        print(f"Added filter '{final_name}' from file: {filepath}")
-        if description:
-            print(f"  Description: {description}")
-        print(f"  Unit type: {unit_type}")
-    
-    @classmethod
-    def add_filter_from_arrays(cls, wavelength: Union[List, np.ndarray], 
-                              response: Union[List, np.ndarray], filter_name: str,
-                              unit_type: str = 'photon', description: str = ''):
-        """Add custom filter from numpy arrays or lists."""
-        curve = FilterCurve(
-            name=filter_name,
-            wavelength=wavelength,
-            response=response,
-            source_type='array',
-            unit_type=unit_type,
-            description=description
-        )
-        
-        cls._custom_filters[filter_name] = curve
-        print(f"Added filter '{filter_name}' from arrays")
-        if description:
-            print(f"  Description: {description}")
-        print(f"  Unit type: {unit_type}")
-    
-    @classmethod
-    def remove_filter(cls, filter_name: str) -> bool:
-        """Remove a custom filter."""
-        if filter_name in cls._custom_filters:
-            del cls._custom_filters[filter_name]
-            print(f"Removed custom filter: {filter_name}")
-            return True
-        else:
-            print(f"Filter '{filter_name}' not found in custom filters")
-            return False
-    
-    @classmethod
-    def get_filter_curve(cls, filter_name: str, observatory: Optional[str] = None) -> FilterCurve:
-        """Get filter response curve."""
-        # Create full filter key for caching
-        full_key = f"{observatory}.{filter_name}" if observatory else filter_name
-        
-        # Check custom filters first
-        if filter_name in cls._custom_filters:
-            return cls._custom_filters[filter_name]
-        
-        # Check if it's a default filter
-        if filter_name in cls._default_broadband + cls._default_mediumband:
-            # If observatory specified, try to load specific observatory filter
-            if observatory:
-                return cls._load_default_filter_with_observatory(filter_name, observatory)
-            else:
-                return cls._load_default_filter(filter_name)
-        
-        raise ValueError(f"Filter '{filter_name}' not found")
-    
-    @classmethod
-    def _load_default_filter_with_observatory(cls, filter_name: str, observatory: str) -> FilterCurve:
-        """Load a specific observatory filter."""
-        cache_key = f"{observatory}.{filter_name}"
-        
-        if cache_key in cls._loaded_curves:
-            return cls._loaded_curves[cache_key]
-        
-        try:
-            # Look specifically for observatory.filter.dat
-            filter_dir = resources.files("Spec7DT.reference.filter_curves")
-            target_filename = f"{observatory}.{filter_name}.dat"
-            
-            with resources.as_file(filter_dir / target_filename) as dat_file:
-                if dat_file.exists():
-                    wavelength, response, file_filter_name, unit_type, description = cls._load_file_filter(dat_file)
-                    
-                    curve = FilterCurve(
-                        name=f"{observatory}.{filter_name}",
-                        wavelength=wavelength,
-                        response=response,
-                        source_type='default',
-                        source_path=str(dat_file),
-                        unit_type=unit_type,
-                        description=description
-                    )
-                    
-                    cls._loaded_curves[cache_key] = curve
-                    return curve
-                else:
-                    raise FileNotFoundError(f"Specific filter file not found: {target_filename}")
-            
-        except Exception as e:
-            # Fall back to general filter search
-            print(f"Could not find {observatory}.{filter_name}.dat, trying general search...")
-            return cls._load_default_filter(filter_name)
-    
-    @classmethod
-    def get_all_filters(cls) -> List[str]:
-        """Return list of all available filters."""
-        return cls._default_broadband + cls._default_mediumband + list(cls._custom_filters.keys())
-    
-    @classmethod
-    def get_custom_filters(cls) -> List[str]:
-        """Return list of custom filters only."""
-        return list(cls._custom_filters.keys())
-    
-    @classmethod
-    def interpolate_filter(cls, filter_name: str, new_wavelength: np.ndarray) -> np.ndarray:
-        """Interpolate filter response to new wavelength grid."""
-        curve = cls.get_filter_curve(filter_name)
-        return np.interp(new_wavelength, curve.wavelength, curve.response, left=0, right=0)
-    
-    @classmethod
-    def save_custom_filter(cls, filter_name: str, filepath: Union[str, Path]):
-        """Save a custom filter to file."""
-        if filter_name not in cls._custom_filters:
-            raise ValueError(f"Custom filter '{filter_name}' not found")
-        
-        curve = cls._custom_filters[filter_name]
-        curve.save_to_file(filepath)
-        print(f"Saved filter '{filter_name}' to: {filepath}")
-    
-    @classmethod
-    def list_filter_info(cls):
-        """Print information about all filters."""
-        print(f"Default broadband filters ({len(cls._default_broadband)}): {', '.join(cls._default_broadband)}")
-        print(f"Default mediumband filters ({len(cls._default_mediumband)}): {len(cls._default_mediumband)} filters")
-        print(f"Custom filters ({len(cls._custom_filters)}):")
-        
-        for name, curve in cls._custom_filters.items():
-            wl_range = f"{curve.wavelength.min():.0f}-{curve.wavelength.max():.0f} Å"
-            print(f"  {name}: {len(curve.wavelength)} points, {wl_range}, source: {curve.source_type}")
-    
-    @classmethod
-    def clear_custom_filters(cls):
-        """Remove all custom filters."""
-        count = len(cls._custom_filters)
-        cls._custom_filters.clear()
-        print(f"Cleared {count} custom filters")
-    
-    @classmethod
-    def get_catcols(cls, cat_type, col_names):
-        """Return a dictionary of given type"""
-        catcols ={"cigale": cls.cigale,
-                  "eazy": cls.eazy,
-                  "lephare": cls.lephare,
-                  "ppxf": cls.ppxf,
-                  "goyangyi": cls.goyangyi
-                  }
-        
-        function = catcols[cat_type.lower()]
-        sig = inspect.signature(function)
-        
-        # image_data, header, error_data, galaxy_name, observatory, band, image_set
-        kwargs = {"self": cls, "col_names": col_names}
-        
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return function(**filtered_kwargs)
-    
-    
-    def cigale(self):
-        cols_cigale = {
-            'GALEX.NUV': 'galex.NUV',
-            'GALEX.FUV': 'galex.FUV',
-            'SDSS.u': 'SDSS_u',
-            'SDSS.g': 'SDSS_g',
-            'SDSS.r': 'SDSS_r',
-            'SDSS.i': 'SDSS_i',
-            'SDSS.z': 'SDSS_z',
-            'PanStarrs.y': 'PAN-STARRS_y',
-            '2MASS.J': 'J_2mass',
-            '2MASS.H': 'H_2mass',
-            '2MASS.Ks': 'Ks_2mass',
-            'Spitzer.ch1': 'spitzer.irac.ch1',
-            'Spitzer.ch2': 'spitzer.irac.ch2',
-            'WISE.w1': 'WISE1',
-            'WISE.w2': 'WISE2',
-            'WISE.w3': 'WISE3',
-            'WISE.w4': 'WISE4',
-            'F657N': 'HST.UVIS1.F657N',
-            'F658N': 'HST.UVIS1.F658N',
-        }
-        cols_cigale.update({f'{key}_err': f'{cols_cigale[key]}_err' for key in cols_cigale.keys() if '_err' not in key})
-        return cols_cigale
-    
-    def eazy(self, col_names):
-        flux_dict = {name:f"F_{name}" for name in col_names if "_err" not in name}
-        err_dict = {name:f"E_{name.strip("_err")}" for name in col_names if "_err" in name}
-        flux_dict.update(err_dict)
-        
-        cols_eazy = flux_dict
-        return cols_eazy
-    
-    def lephare(self):
-        cols_lephare = {
-            
-        }
-        return cols_lephare
-    
-    def ppxf(self):
-        cols_ppxf = {
-            
-        }
-        return cols_ppxf
-    
-    
-    def goyangyi(self):
-        cols_cigale = self.cigale(self)
-        print(" ╱|、\n(˚ˎ 。7  \n |、˜〵          \n じしˍ,)ノ")
-        return cols_cigale
 
 class Observatories:
     """Class to handle different observatories and their properties."""
@@ -410,33 +21,77 @@ class Observatories:
         
     def _opticals(self):
         """Return a list of optical observatories."""
-        return ['HST', 'SDSS', 'PS1', 'CFHT', 'DECam', 'DES', 'LSST', 'Pan-STARRS', 'Subaru', '7DT', 'SkyMapper']
+        return ['SDSS', 'PS1', 'DECam', 'DES', 'LSST', 'Pan-STARRS', 'Subaru', '7DT', 'SkyMapper', 'SLOAN']
     
     def _infrareds(self):
         """Return a list of infrared observatories."""
-        return ['WISE', 'Spitzer', 'Herschel', 'JWST', 'VISTA', 'UKIDSS', '2MASS', 'SPHEREx']
+        return ['WISE', 'Spitzer', 'Herschel', 'JWST', 'VISTA', 'UKIDSS', '2MASS', 'SPHEREx', 'PACS', 'SPIRE']
     
     def _ultraviolet(self):
         """Return a list of ultraviolet observatories."""
-        return ['GALEX', 'HST', 'FUSE']
+        return ['GALEX']
     
     def _radio(self):
         """Return a list of radio observatories."""
-        return ['VLA', 'ALMA', 'LOFAR', 'SKA', 'MeerKAT', 'GMRT']
+        return ['VLA', 'ALMA', 'SKA', 'MeerKAT', 'GMRT']
     
     @classmethod
     def get_observatories(cls):
         """Return a list of all observatories."""
         return cls().observatories
+    
 
 class useful_functions:
+    @classmethod
+    def get_redshift(cls, galaxy_name):
+        """
+        Query redshift from NED using galaxy name.
+        
+        Parameters:
+        -----------
+        galaxy_name : str
+            Name of the galaxy (e.g., 'NGC 3627', 'M81', 'NGC4321')
+        
+        Returns:
+        --------
+        float or None
+            Redshift value, or None if not found
+        """
+        from astroquery.ned import Ned
+        
+        try:
+            # Query basic information from NED
+            result_table = Ned.query_object(galaxy_name)
+            
+            if len(result_table) > 0:
+                # Get the redshift value
+                redshift = result_table['Redshift'][0]
+                
+                # Check if redshift is valid (not masked or NaN)
+                if not np.ma.is_masked(redshift) and not np.isnan(redshift):
+                    return float(redshift)
+                else:
+                    print(f"No redshift data available for {galaxy_name}")
+                    return None
+            else:
+                print(f"Galaxy {galaxy_name} not found in NED")
+                return None
+                
+        except Exception as e:
+            print(f"Error querying {galaxy_name}: {str(e)}")
+            return None
     
     @classmethod
     def get_galaxy_radius(cls, image):
-        
         threshold = detect_threshold(image, nsigma=3.0)
 
         segm = detect_sources(image, threshold, npixels=5)
+        if segm is None:
+            print("No sources detected.")
+            a, b = image.shape
+            x0, y0 = image.shape[0]/2, image.shape[1]/2
+            theta = 0
+            return x0, y0, a, b, theta
 
         catalog = SourceCatalog(image, segm)
         gal = max(catalog, key=lambda src: src.area)
@@ -445,6 +100,29 @@ class useful_functions:
         a, b = gal.semimajor_sigma.value*2, gal.semiminor_sigma.value*2
         theta = math.radians(gal.orientation.value)
         return x0, y0, a, b, theta
+    
+    @staticmethod
+    def find_rec(N):
+        # Start from the square root of N and work downwards
+        num_found = False
+        while not num_found:
+            for k in range(int(N ** 0.5), 0, -1):
+                if N % k == 0:  # k must divide N
+                    l = N // k  # Calculate l
+                    # Check the condition that neither exceeds twice the other
+                    if k <= 2 * l and l <= 2 * k:
+                        num_found = True
+                        return k, l
+            N = N + 1
+        return None, None  # Return None if no valid pair is found
+    
+    @staticmethod
+    def get_pixel_scale(header, typical=1.0):
+        cd1_1 = np.abs(header.get("CD1_1", header.get("PC1_1", header.get("CDELT1", typical))))
+        cd1_2 = np.abs(header.get("CD1_2", header.get("PC1_2", 0.00)))
+        pixel_scale = 3600 * np.sqrt(cd1_1 ** 2 + cd1_2 ** 2)
+        print(pixel_scale, header.get("DATE-OBS", ""))
+        return pixel_scale
     
     @staticmethod
     def extract_values_recursive(dictionary, key):
@@ -529,3 +207,222 @@ class useful_functions:
                 yield from self.tour_nested_dict_recursive(value, current_keys + (key,))
         else:
             yield current_keys, obj
+            
+    @classmethod
+    def pa_sky_to_image(cls, x, y, pa_east_of_north, wcs, offset_deg=0.001):
+        """
+        Convert Position Angle from astronomical standard (East of North) 
+        to image coordinates (Right of Top) for plotting.
+        
+        Parameters
+        ----------
+        x : float
+            X pixel coordinate (column)
+        y : float
+            Y pixel coordinate (row)
+        pa_east_of_north : float
+            Position angle in degrees, measured East of North
+            (astronomical standard: 0° = North, 90° = East)
+        wcs : astropy.wcs.WCS
+            WCS object for coordinate transformation
+        offset_deg : float, optional
+            Small offset in degrees for numerical calculation (default: 0.001)
+        
+        Returns
+        -------
+        pa_image : float
+            Position angle in image coordinates (degrees)
+            Measured Right of Top (0° = up, 90° = right)
+            This is the angle for matplotlib plotting
+        """
+        # Get sky coordinate at the reference point
+        sky_center = wcs.pixel_to_world(x, y)
+        
+        # Calculate offset point in sky coordinates along the PA direction
+        pa_rad = np.radians(pa_east_of_north)
+        
+        # East of North: 0° = North, 90° = East
+        # dRA increases toward East, dDec increases toward North
+        dra = offset_deg * np.sin(pa_rad) / np.cos(np.radians(sky_center.dec.deg))
+        ddec = offset_deg * np.cos(pa_rad)
+        
+        # Create offset sky coordinate
+        sky_offset = SkyCoord(
+            ra=sky_center.ra + dra * u.deg,
+            dec=sky_center.dec + ddec * u.deg,
+            frame=sky_center.frame
+        )
+        
+        # Transform both points to pixel coordinates
+        x_center, y_center = wcs.world_to_pixel(sky_center)
+        x_offset, y_offset = wcs.world_to_pixel(sky_offset)
+        
+        # Calculate image PA (Right of Top)
+        # In image coordinates: +X is right, +Y is up (in standard matplotlib display)
+        dx = x_offset - x_center
+        dy = y_offset - y_center
+        
+        # arctan2(dx, dy) gives angle Right of Top
+        pa_image = np.degrees(np.arctan2(dx, dy))
+        
+        return pa_image
+
+    @classmethod
+    def plot_pa_on_image(cls, image, x, y, pa_east_of_north, wcs, length=50, 
+                        ax=None, color='red', linewidth=2, label=None):
+        """
+        Plot a position angle line on an astronomical image.
+        
+        Parameters
+        ----------
+        image : 2D array
+            Image data to display
+        x : float
+            X pixel coordinate (center of PA line)
+        y : float
+            Y pixel coordinate (center of PA line)
+        pa_east_of_north : float
+            Position angle in degrees (East of North)
+        wcs : astropy.wcs.WCS
+            WCS object for the image
+        length : float, optional
+            Length of PA line in pixels (default: 50)
+        ax : matplotlib.axes.Axes, optional
+            Axes to plot on (creates new figure if None)
+        color : str, optional
+            Color of PA line (default: 'red')
+        linewidth : float, optional
+            Width of PA line (default: 2)
+        label : str, optional
+            Label for the PA line
+        
+        Returns
+        -------
+        ax : matplotlib.axes.Axes
+            The axes object with the plot
+        """
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10, 10))
+        
+        # Display the image
+        ax.imshow(image, origin='lower', cmap='gray', interpolation='nearest')
+        
+        # Convert PA to image coordinates
+        pa_image = cls.pa_sky_to_image(x, y, pa_east_of_north, wcs)
+        
+        # Calculate line endpoints in image coordinates
+        pa_rad = np.radians(pa_image)
+        dx = length/2 * np.sin(pa_rad)
+        dy = length/2 * np.cos(pa_rad)
+        
+        x1, y1 = x - dx, y - dy
+        x2, y2 = x + dx, y + dy
+        
+        # Plot the PA line
+        ax.plot([x1, x2], [y1, y2], color=color, linewidth=linewidth, 
+                label=label if label else f'PA = {pa_east_of_north:.1f}° E of N')
+        
+        # Mark the center point
+        ax.plot(x, y, 'o', color=color, markersize=8)
+        
+        # Add arrow at the positive direction
+        ax.annotate('', xy=(x2, y2), xytext=(x, y),
+                    arrowprops=dict(arrowstyle='->', color=color, lw=linewidth))
+        
+        return ax
+
+    @classmethod
+    def plot_compass_rose(cls, ax, x, y, wcs, size=30, color='cyan'):
+        """
+        Add a compass rose showing North and East directions on the image.
+        
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes
+            Axes to plot on
+        x : float
+            X pixel coordinate for compass center
+        y : float
+            Y pixel coordinate for compass center
+        wcs : astropy.wcs.WCS
+            WCS object
+        size : float, optional
+            Size of compass arrows in pixels (default: 30)
+        color : str, optional
+            Color of compass arrows (default: 'cyan')
+        """
+        # North direction (PA = 0°)
+        pa_north = cls.pa_sky_to_image(x, y, 0, wcs)
+        dx_n = size * np.sin(np.radians(pa_north))
+        dy_n = size * np.cos(np.radians(pa_north))
+        
+        # East direction (PA = 90°)
+        pa_east = cls.pa_sky_to_image(x, y, 90, wcs)
+        dx_e = size * np.sin(np.radians(pa_east))
+        dy_e = size * np.cos(np.radians(pa_east))
+        
+        # Plot North arrow
+        ax.annotate('',xy=(x + dx_n, y + dy_n), xytext=(x, y),
+                    arrowprops=dict(
+                    arrowstyle='-|>',
+                    lw=2,
+                    color=color,
+                    mutation_scale=5,
+                    shrinkA=0,
+                    shrinkB=0))
+        ax.text(x + dx_n*1.2, y + dy_n*1.2, 'N', color=color, 
+                fontsize=7, fontweight='bold', ha='center', va='center')
+        
+        # Plot East arrow
+        ax.annotate('',xy=(x + dx_e, y + dy_e), xytext=(x, y),
+                    arrowprops=dict(
+                    arrowstyle='-|>',
+                    lw=2,
+                    color=color,
+                    mutation_scale=5,
+                    shrinkA=0,
+                    shrinkB=0))
+        ax.text(x + dx_e*1.2, y + dy_e*1.2, 'E', color=color,
+                fontsize=7, fontweight='bold', ha='center', va='center')
+        
+    @classmethod
+    def plot_scale(cls, ax, x, y, wcs, size=30, color='cyan'):
+        """
+        Add a compass rose showing North and East directions on the image.
+        
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes
+            Axes to plot on
+        x : float
+            X pixel coordinate for compass center
+        y : float
+            Y pixel coordinate for compass center
+        wcs : astropy.wcs.WCS
+            WCS object
+        size : float, optional
+            Size of compass arrows in arcseconds (default: 30)
+        color : str, optional
+            Color of compass arrows (default: 'cyan')
+        """
+        
+        pixel_scale = cls.get_pixel_scale(wcs.to_header())
+        size_pix = size / pixel_scale
+        
+        if size < 60:
+            scale_text =  f'{size}'+r'$^{\prime\prime}$'
+        elif (size >= 60) and (size < 3600):
+            scale_text =  f'{size/60:.1f}'+r'$^\prime$'
+        else:
+            scale_text =  f'{size/3600:.1f}'+r'$^\circ$'
+        
+        ax.annotate('',xy=(x + size_pix/2, y), xytext=(x - size_pix/2, y),
+                    arrowprops=dict(
+                    arrowstyle='-',
+                    lw=2,
+                    color=color,
+                    mutation_scale=5,
+                    shrinkA=0,
+                    shrinkB=0))
+        ax.text(x, y + size_pix * 0.3, scale_text, color=color,
+                fontsize=7, fontweight='bold', ha='center', va='center')

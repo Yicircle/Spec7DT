@@ -9,27 +9,28 @@ from glob import glob
 from functools import wraps
 from typing import Callable, Optional, Union, List
 
-from .utility import Filters, Observatories
+from .utility import Observatories
 from .utility import useful_functions
 from .file_generator import *
+from ..plot.plot import DrawGalaxy
+from ..handlers.filter_handler import Filters
 
 
-class GalaxyImageSet():
+class GalaxyImageSet:
     __signature__ = inspect.Signature()
-    
+
     def __init__(self):
-        self.data = {}
-        self.header = {}
-        self.error = {}
-        self.psf = {}
-        self.obs = {}
-        self.files = []
+        self._data = {}
+        self._header = {}
+        self._error = {}
+        self._psf = {}
+        self._cutout_shape = {}
+        self._obs = {}
+        self._files = []
+        self.filter_inst = Filters()
+        
         
     def add_image(self, filepath):
-        """
-        Add an image to the dataset under a galaxy and band identifier.
-        Automatically loads the FITS data into memory.
-        """
         filepath = Path(filepath)
         if not filepath.exists():
             raise FileNotFoundError(f"File {filepath} not found")
@@ -38,79 +39,48 @@ class GalaxyImageSet():
             image_data = hdul[0].data
             image_header = hdul[0].header
 
-        # Parse galaxy name, band, and observatory from the filename
+        
         file_name = filepath.stem
-        print(file_name)
         galaxy_name = Parsers._galaxy_name_parser(file_name=file_name)
-        band = Parsers._band_name_parser(file_name=file_name)
+        band = Parsers._band_name_parser(file_name=file_name, filter_inst=self.filter_inst)
         observatory = Parsers._observatory_name_parser(file_name=file_name)
-        print(galaxy_name, band, observatory)
         if galaxy_name is None or band is None or observatory is None:
             return
-        
-        if galaxy_name not in self.data:
-            self.data[galaxy_name] = {}
-            self.header[galaxy_name] = {}
-            self.error[galaxy_name] = {}
-            self.psf[galaxy_name] = {}
-            
-        if observatory not in self.data[galaxy_name]:
-            self.data[galaxy_name][observatory] = {}
-            self.header[galaxy_name][observatory] = {}
-            self.error[galaxy_name][observatory] = {}
-            self.psf[galaxy_name][observatory] = {}
-                
-        self.data[galaxy_name][observatory][band] = image_data
-        self.header[galaxy_name][observatory][band] = image_header
-        self.psf[galaxy_name][observatory][band] = -1.0
-        self.files.append(str(filepath))
-        
-        # Find error map and add to variable
+
+        for attr in [self._data, self._header, self._error, self._psf, self._cutout_shape]:
+            attr.setdefault(galaxy_name, {}).setdefault(observatory, {})
+
+        self._data[galaxy_name][observatory][band] = image_data
+        self._header[galaxy_name][observatory][band] = image_header
+        self._psf[galaxy_name][observatory][band] = -1.0
+        self._cutout_shape[galaxy_name][observatory][band] = set()
+        self._files.append(str(filepath))
+
         err_name = filepath.with_name(filepath.stem + "_err").with_suffix(filepath.suffix)
-        
         if not err_name.exists():
             warnings.warn(f"Error File {err_name} not found. Continue without error map.")
-            self.error[galaxy_name][observatory][band] = np.zeros_like(image_data)
+            self._error[galaxy_name][observatory][band] = np.zeros_like(image_data)
         else:
             with fits.open(err_name) as hdul_err:
                 error_data = hdul_err[0].data
-            
-            self.error[galaxy_name][observatory][band] = error_data
-        
-    # Update image data
+            self._error[galaxy_name][observatory][band] = error_data
+
     def update_data(self, image_data, galaxy_name, observatory, band):
-        """
-        Update an image to the dataset under a galaxy and band identifier.
-        """
-        # print(self.data[galaxy_name][observatory][band].shape)
-        # print(np.nansum(self.data[galaxy_name][observatory][band]))
-        
-        if galaxy_name is None or band is None or observatory is None:
-            raise KeyError("Specify the galaxy name, band and observatory name.")
-        
-        if (galaxy_name not in self.data 
-            or observatory not in self.data[galaxy_name] 
-            or band not in self.data[galaxy_name][observatory]):
-            raise KeyError("Input valid name.")
-                
-        self.data[galaxy_name][observatory][band] = image_data
-        # print(self.data[galaxy_name][observatory][band].shape)
-        # print(np.nansum(self.data[galaxy_name][observatory][band]))
-        
+        if not all([galaxy_name, observatory, band]):
+            raise KeyError("Specify galaxy, observatory, and band.")
+        try:
+            self._data[galaxy_name][observatory][band] = image_data
+        except KeyError:
+            raise KeyError("Invalid galaxy/observatory/band specified")
+
     def update_error(self, error_data, galaxy_name, observatory, band):
-        """
-        Update an image to the dataset under a galaxy and band identifier.
-        """
-        
-        if galaxy_name is None or band is None or observatory is None:
-            raise KeyError("Specify the galaxy name, band and observatory name.")
-        
-        if (galaxy_name not in self.error 
-            or observatory not in self.error[galaxy_name] 
-            or band not in self.error[galaxy_name][observatory]):
-            raise KeyError("Input valid name.")
-                
-        self.error[galaxy_name][observatory][band] = error_data
+        if not all([galaxy_name, observatory, band]):
+            raise KeyError("Specify galaxy, observatory, and band.")
+        try:
+            self._error[galaxy_name][observatory][band] = error_data
+        except KeyError:
+            raise KeyError("Invalid galaxy/observatory/band specified")
+    
         
     # merging / append instance
     def append(self, other):
@@ -125,69 +95,69 @@ class GalaxyImageSet():
             raise TypeError("Can only append another GalaxyImageSet instance")
         
         # Merge data
-        for galaxy_name, observatories in other.data.items():
-            if galaxy_name not in self.data:
-                self.data[galaxy_name] = {}
+        for galaxy_name, observatories in other._data.items():
+            if galaxy_name not in self._data:
+                self._data[galaxy_name] = {}
             
             for observatory, bands in observatories.items():
-                if observatory not in self.data[galaxy_name]:
-                    self.data[galaxy_name][observatory] = {}
+                if observatory not in self._data[galaxy_name]:
+                    self._data[galaxy_name][observatory] = {}
                 
                 for band, image_data in bands.items():
                     # Override if exists, add if new
-                    self.data[galaxy_name][observatory][band] = image_data
+                    self._data[galaxy_name][observatory][band] = image_data
         
         # Merge headers
-        for galaxy_name, observatories in other.header.items():
+        for galaxy_name, observatories in other._header.items():
             if galaxy_name not in self.header:
-                self.header[galaxy_name] = {}
+                self._header[galaxy_name] = {}
             
             for observatory, bands in observatories.items():
-                if observatory not in self.header[galaxy_name]:
-                    self.header[galaxy_name][observatory] = {}
+                if observatory not in self._header[galaxy_name]:
+                    self._header[galaxy_name][observatory] = {}
                 
                 for band, header_data in bands.items():
-                    self.header[galaxy_name][observatory][band] = header_data
+                    self._header[galaxy_name][observatory][band] = header_data
         
         # Merge error data
         for galaxy_name, observatories in other.error.items():
             if galaxy_name not in self.error:
-                self.error[galaxy_name] = {}
+                self._error[galaxy_name] = {}
             
             for observatory, bands in observatories.items():
-                if observatory not in self.error[galaxy_name]:
-                    self.error[galaxy_name][observatory] = {}
+                if observatory not in self._error[galaxy_name]:
+                    self._error[galaxy_name][observatory] = {}
                 
                 for band, error_data in bands.items():
-                    self.error[galaxy_name][observatory][band] = error_data
+                    self._error[galaxy_name][observatory][band] = error_data
         
         # Merge PSF data
-        for galaxy_name, observatories in other.psf.items():
-            if galaxy_name not in self.psf:
-                self.psf[galaxy_name] = {}
+        for galaxy_name, observatories in other._psf.items():
+            if galaxy_name not in self._psf:
+                self._psf[galaxy_name] = {}
             
             for observatory, bands in observatories.items():
-                if observatory not in self.psf[galaxy_name]:
-                    self.psf[galaxy_name][observatory] = {}
+                if observatory not in self._psf[galaxy_name]:
+                    self._psf[galaxy_name][observatory] = {}
                 
                 for band, psf_data in bands.items():
-                    self.psf[galaxy_name][observatory][band] = psf_data
+                    self._psf[galaxy_name][observatory][band] = psf_data
         
         # Merge obs data
-        for galaxy_name, obs_data in other.obs.items():
+        for galaxy_name, obs_data in other._obs.items():
             if galaxy_name not in self.obs:
-                self.obs[galaxy_name] = obs_data
+                self._obs[galaxy_name] = obs_data
             else:
                 # If both have obs data for the same galaxy, merge them
-                if isinstance(self.obs[galaxy_name], dict) and isinstance(obs_data, dict):
-                    self.obs[galaxy_name].update(obs_data)
+                if isinstance(self._obs[galaxy_name], dict) and isinstance(obs_data, dict):
+                    self._obs[galaxy_name].update(obs_data)
                 else:
-                    self.obs[galaxy_name] = obs_data
+                    self._obs[galaxy_name] = obs_data
         
         # Merge file lists (avoid duplicates)
-        for filepath in other.files:
-            if filepath not in self.files:
-                self.files.append(filepath)
+        for filepath in other._files:
+            if filepath not in self._files:
+                self._files.append(filepath)
 
 
     def merge(self, other):
@@ -214,44 +184,121 @@ class GalaxyImageSet():
         merged.append(other)
         
         return merged
+    
 
+    @property
+    def files(self):
+        """Read Only: Path of Files"""
+        return tuple(self._files)
+    
+    @property
+    def data(self):
+        return self._data
 
-    # Get data
-    def get_galaxy_data(self, galaxy_name):
-        """Return all band images for a specific galaxy."""
-        return self.data.get(galaxy_name, {})
-    
-    def get_observatory_image(self, galaxy_name, observatory):
-        """Return image of a specific observatory for a specific galaxy"""
-        return self.data.get(galaxy_name, {}).get(observatory, None)
-    
-    def get_band_image(self, galaxy_name, observatory, band):
-        """Return image of a specific band for a specific galaxy."""
-        return self.data.get(galaxy_name, {}).get(observatory, {}).get(band, None)
-    
-    def get_header(self, galaxy_name=None, band=None):
-        """Return header information for a specific galaxy or band."""
-        return self.header.get(galaxy_name, {}).get(band, None) if galaxy_name else self.header
+    @data.setter
+    def data(self, value_tuple):
+        galaxy, observatory, band, image_data = value_tuple
+        try:
+            self._data[galaxy][observatory][band] = image_data
+        except KeyError:
+            raise KeyError("Invalid galaxy/observatory/band for setting image data.")
+        
+    @property
+    def header(self):
+        return self._header
 
-    def get_psf(self, galaxy_name=None):
-        return useful_functions.extract_values_recursive(self.psf, galaxy_name)
-    
-    
-    # Set data
-    def set_psf(self, galaxy_name, observatory, band, new_psf_value):
-        self.psf[galaxy_name][observatory][band] = new_psf_value
+    @header.setter
+    def header(self, value_tuple):
+        galaxy, observatory, band, header_data = value_tuple
+        try:
+            self._header[galaxy][observatory][band] = header_data
+        except KeyError:
+            raise KeyError("Invalid galaxy/observatory/band for setting image data.")
+        
+    @property
+    def error(self):
+        return self._error
 
+    @error.setter
+    def error(self, value_tuple):
+        galaxy, observatory, band, image_data = value_tuple
+        try:
+            self._error[galaxy][observatory][band] = image_data
+        except KeyError:
+            raise KeyError("Invalid galaxy/observatory/band for setting image data.")
+
+    @property
+    def psf(self):
+        return self._psf
+    
+    @psf.setter
+    def psf(self, value_tuple):
+        if not isinstance(value_tuple, tuple):
+            raise TypeError("psf.setter expects a tuple.")
+        
+        if len(value_tuple) == 4:
+            galaxy, observatory, band, new_val = value_tuple
+            if galaxy not in self._psf:
+                self._psf[galaxy] = {}
+            if observatory not in self._psf[galaxy]:
+                self._psf[galaxy][observatory] = {}
+            self._psf[galaxy][observatory][band] = new_val
+
+        elif len(value_tuple) == 3:
+            galaxy, val_name, new_val = value_tuple
+            if galaxy not in self._psf:
+                self._psf[galaxy] = {}
+            self._psf[galaxy][val_name] = new_val
+
+        else:
+            raise ValueError("value_tuple must be length 3 or 4.")
+
+    @property
+    def cutout_shape(self):
+        return self._cutout_shape
+
+    @cutout_shape.setter
+    def cutout_shape(self, value_tuple):
+        if not hasattr(value_tuple, '__iter__'):
+            raise TypeError("cutout_shape setter expects an iterable (tuple or list)")
+        if len(value_tuple) != 4:
+            raise ValueError("cutout_shape setter expects length-4 tuple: (galaxy, observatory, band, box_shape)")
+
+        galaxy, observatory, band, box_shape = value_tuple
+
+        if not (isinstance(box_shape, (list, tuple))):
+            raise ValueError("box_shape must be tuple/list")
+
+        if galaxy not in self._cutout_shape:
+            self._cutout_shape[galaxy] = {}
+        if observatory not in self._cutout_shape[galaxy]:
+            self._cutout_shape[galaxy][observatory] = {}
+
+        self._cutout_shape[galaxy][observatory][band] = box_shape
+        
+        print(f"Set cutout_shape[{galaxy}][{observatory}][{band}] = {box_shape}")
+        
     def summary(self):
         """Print summary of galaxies and available bands."""
-        for galaxy, val in self.data.items():
+        for galaxy, val in self._data.items():
             for obs, bands in val.items():
                 galaxy = sorted(galaxy) if isinstance(galaxy, list) else [galaxy]
                 obs = sorted(obs) if isinstance(obs, list) else [obs]
                 print(f"Galaxy: {galaxy}\nObservatories: {obs} \nBands: {sorted(bands.keys())}")
                 
-    # Get file from instance
-    def get_input_file(self):
-        pass
+    # ==== Plotting Properties ====
+    def plot_image(self, value_tuple):
+        if not hasattr(value_tuple, '__iter__'):
+            raise TypeError("plot_image expects an iterable (tuple or list)")
+        if len(value_tuple) != 3:
+            raise ValueError("plot_image expects length-3 tuple: (galaxy, observatory, band)")
+        
+        galaxy, observatory, band = value_tuple
+        try:
+            fig, ax = DrawGalaxy.single_galaxy(self, galaxy, observatory, band)
+            return fig, ax
+        except KeyError:
+            raise KeyError("Invalid galaxy/observatory/band for plotting image data.")
         
 
 class Parsers:
@@ -282,11 +329,12 @@ class Parsers:
         return None
     
     @staticmethod
-    def _band_name_parser(file_name):
+    def _band_name_parser(file_name, filter_inst):
         """Parse band names from a given string or list."""
         if not isinstance(file_name, str):
             raise ValueError("file_name must be a string")
-        for band in Filters.get_all_filters():
+        
+        for band in filter_inst.get_all_filters():
             pattern = "|".join(map(re.escape, ['-', ' ', '_', '.']))
             if band in re.split(pattern, file_name):
                 return band

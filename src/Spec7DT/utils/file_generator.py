@@ -4,7 +4,8 @@ import numpy as np
 
 from astropy.table import Table
 
-from .utility import Filters, useful_functions
+from .utility import useful_functions
+from ..handlers.filter_handler import Filters
 
 class inputGenerator:
     def __init__(self):
@@ -42,5 +43,9 @@ class inputGenerator:
         df.rename(columns=colnames, inplace=True)
         
         df.reset_index()
+        
+        galaxies = list(image_set.data.keys())
+        for g in galaxies:
+            df.loc[df['id'].str.contains(g), 'redshift'] = useful_functions.get_redshift(g)
             
         return df

@@ -1,5 +1,6 @@
 import numpy as np
 import warnings
+from .utility import useful_functions
 warnings.filterwarnings("ignore", category=RuntimeWarning) 
 
 class conversion:
@@ -11,7 +12,9 @@ class conversion:
                          'Spitzer': self.Spitzer,
                          'WISE': self.WISE,
                          '2MASS': self.TMASS,
-                         'SPHEREx': self.Spitzer
+                         'SPHEREx': self.SPHEREx,
+                         'PACS': self.pacs,
+                         'SPIRE': self.spire
                          }
     
     def unitConvertor(self, image_data, header, error_data, galaxy_name, observatory, band, image_set):
@@ -48,6 +51,8 @@ class conversion:
         try:
             # All functions now have standardized signature
             convert_im, convert_err = conversion_func(image_data, header, band), conversion_func(error_data, header, band)
+            convert_im = np.nan_to_num(convert_im, nan=0.0)
+            
             image_set.update_data(convert_im, galaxy_name, observatory, band)
             image_set.update_error(convert_err, galaxy_name, observatory, band)
                 
@@ -57,7 +62,18 @@ class conversion:
     
     # UVs
     def GALEX(self, image_data, header=None, band=None):
-        return np.array(image_data) * 1e-3
+        if band == 'FUV':
+            coeff = 1.4 * 1e-15
+            l_eff = 1535.08
+        elif band == 'NUV':
+            coeff = 2.06 * 1e-16
+            l_eff = 2300.78
+        else:
+            raise ValueError(f'Unknown filter name: {band}')
+        
+        f_lambda = coeff * image_data
+        f_nu = f_lambda * (l_eff ** 2) * 3.33564095e4 * 1e3
+        return np.array(f_nu)
     
     
     # Opticals
@@ -69,7 +85,9 @@ class conversion:
             ZP = header['ZP_AUTO']
         except KeyError:
             raise KeyError("Zero Point value is not found.")
-        flux = 3631 * (image_data) * 10 ** (-ZP / 2.5) * 1e3
+        mag = -2.5 * np.log10(image_data) + ZP
+        flux = 10 ** (-0.4 * (mag - 8.90)) * 1e3
+        # flux = 3631 * (image_data) * 10 ** (-ZP / 2.5) * 1e3
         return flux
 
     def PanStarr1(self, image_data, header, band=None):
@@ -81,7 +99,13 @@ class conversion:
     
     # IRs
     def Spitzer(self, image_data, header=None, band=None):  # MJy/sr
-        return 1e9 * ((1.1e-4 * 3600 / 206265.0) ** 2) * image_data
+        pixel_scale = useful_functions.get_pixel_scale(header, typical=0.0001666667)
+        return 1e9 * ((pixel_scale / 206265.0) ** 2) * image_data
+    
+    def SPHEREx(self, image_data, header=None, band=None):  # MJy/sr
+        # pixel_scale = useful_functions.get_pixel_scale(header, typical=0.0017222222)
+        # return 1e9 * ((pixel_scale / 206265.0) ** 2) * image_data
+        return image_data
     
     def WISE(self, image_data, header=None, band=None):  #ADU/DN
         # WISE flux calibration factors
@@ -105,13 +129,24 @@ class conversion:
     def TMASS(self, image_data, header, band=None):
         zp_2mass = {'j': 21.1258,
                     'h': 20.7288,
-                    'k': 20.1106
+                    'k': 20.1106,
+                    'ks': 20.1106
                     }
         zpflux_2mass = {'j': 1594,
                         'h': 1024,
-                        'k': 666.7
+                        'k': 666.7,
+                        'ks': 666.7
                         }
 
-        mag = -2.5 * np.log10(image_data) + zp_2mass[header['FILTER']]
-        f_nu = 10 ** (-0.4 * mag) * zpflux_2mass[header['FILTER']] * 1e3  # [mJy]
+        mag = -2.5 * np.log10(image_data) + zp_2mass[header.get("FILTER", band.lower())]
+        f_nu = 10 ** (-0.4 * mag) * zpflux_2mass[header.get("FILTER", band.lower())] * 1e3  # [mJy]
         return f_nu
+    
+    # sub-mms
+    def pacs(self, image_data, header=None, band=None):  # Jy/pixel
+        return 1e3 * image_data
+    
+    def spire(self, image_data, header=None, band=None):  # MJy/sr
+        pixel_scale = useful_functions.get_pixel_scale(header, typical=0.0017222222)
+        # return 1e9 * ((pixel_scale / 206265.0) ** 2) * image_data
+        return 1e3 * image_data
