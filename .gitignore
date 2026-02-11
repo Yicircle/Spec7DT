@@ -24,6 +24,7 @@ lib64/
 parts/
 sdist/
 var/
+src/Spec7DT/reference/psfs/*.fits
 *.egg-info/
 .installed.cfg
 *.egg
