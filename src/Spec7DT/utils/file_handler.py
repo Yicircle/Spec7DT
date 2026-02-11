@@ -1,13 +1,10 @@
 import numpy as np
 from pathlib import Path
 from astropy.io import fits
-import pandas as pd
 import re
 import inspect
 import warnings
 from glob import glob
-from functools import wraps
-from typing import Callable, Optional, Union, List
 
 from .utility import Observatories
 from .utility import useful_functions
@@ -26,7 +23,7 @@ class GalaxyImageSet:
         self._psf = {}
         self._cutout_shape = {}
         self._obs = {}
-        self._files = []
+        self._files = {}
         self.filter_inst = Filters()
         
         
@@ -36,7 +33,7 @@ class GalaxyImageSet:
             raise FileNotFoundError(f"File {filepath} not found")
 
         with fits.open(filepath) as hdul:
-            image_data = hdul[0].data
+            image_data = np.array(hdul[0].data, dtype=np.float32)
             image_header = hdul[0].header
 
         
@@ -47,14 +44,14 @@ class GalaxyImageSet:
         if galaxy_name is None or band is None or observatory is None:
             return
 
-        for attr in [self._data, self._header, self._error, self._psf, self._cutout_shape]:
+        for attr in [self._data, self._header, self._error, self._psf, self._cutout_shape, self._files]:
             attr.setdefault(galaxy_name, {}).setdefault(observatory, {})
 
         self._data[galaxy_name][observatory][band] = image_data
         self._header[galaxy_name][observatory][band] = image_header
-        self._psf[galaxy_name][observatory][band] = -1.0
+        self._psf[galaxy_name][observatory][band] = ""
         self._cutout_shape[galaxy_name][observatory][band] = set()
-        self._files.append(str(filepath))
+        self._files[galaxy_name][observatory][band] = str(filepath)
 
         err_name = filepath.with_name(filepath.stem + "_err").with_suffix(filepath.suffix)
         if not err_name.exists():
@@ -78,6 +75,14 @@ class GalaxyImageSet:
             raise KeyError("Specify galaxy, observatory, and band.")
         try:
             self._error[galaxy_name][observatory][band] = error_data
+        except KeyError:
+            raise KeyError("Invalid galaxy/observatory/band specified")
+        
+    def update_header(self, updated_header, galaxy_name, observatory, band):
+        if not all([galaxy_name, observatory, band]):
+            raise KeyError("Specify galaxy, observatory, and band.")
+        try:
+            self._header[galaxy_name][observatory][band] = updated_header
         except KeyError:
             raise KeyError("Invalid galaxy/observatory/band specified")
     
@@ -104,12 +109,11 @@ class GalaxyImageSet:
                     self._data[galaxy_name][observatory] = {}
                 
                 for band, image_data in bands.items():
-                    # Override if exists, add if new
                     self._data[galaxy_name][observatory][band] = image_data
         
         # Merge headers
         for galaxy_name, observatories in other._header.items():
-            if galaxy_name not in self.header:
+            if galaxy_name not in self._header:
                 self._header[galaxy_name] = {}
             
             for observatory, bands in observatories.items():
@@ -120,8 +124,8 @@ class GalaxyImageSet:
                     self._header[galaxy_name][observatory][band] = header_data
         
         # Merge error data
-        for galaxy_name, observatories in other.error.items():
-            if galaxy_name not in self.error:
+        for galaxy_name, observatories in other._error.items():
+            if galaxy_name not in self._error:
                 self._error[galaxy_name] = {}
             
             for observatory, bands in observatories.items():
@@ -143,9 +147,33 @@ class GalaxyImageSet:
                 for band, psf_data in bands.items():
                     self._psf[galaxy_name][observatory][band] = psf_data
         
+        # Merge cutout_shape data
+        for galaxy_name, observatories in other._cutout_shape.items():
+            if galaxy_name not in self._cutout_shape:
+                self._cutout_shape[galaxy_name] = {}
+            
+            for observatory, bands in observatories.items():
+                if observatory not in self._cutout_shape[galaxy_name]:
+                    self._cutout_shape[galaxy_name][observatory] = {}
+                
+                for band, cutout_data in bands.items():
+                    self._cutout_shape[galaxy_name][observatory][band] = cutout_data
+        
+        # Merge files data (nested dict structure)
+        for galaxy_name, observatories in other._files.items():
+            if galaxy_name not in self._files:
+                self._files[galaxy_name] = {}
+            
+            for observatory, bands in observatories.items():
+                if observatory not in self._files[galaxy_name]:
+                    self._files[galaxy_name][observatory] = {}
+                
+                for band, filepath in bands.items():
+                    self._files[galaxy_name][observatory][band] = filepath
+        
         # Merge obs data
         for galaxy_name, obs_data in other._obs.items():
-            if galaxy_name not in self.obs:
+            if galaxy_name not in self._obs:
                 self._obs[galaxy_name] = obs_data
             else:
                 # If both have obs data for the same galaxy, merge them
@@ -153,11 +181,6 @@ class GalaxyImageSet:
                     self._obs[galaxy_name].update(obs_data)
                 else:
                     self._obs[galaxy_name] = obs_data
-        
-        # Merge file lists (avoid duplicates)
-        for filepath in other._files:
-            if filepath not in self._files:
-                self._files.append(filepath)
 
 
     def merge(self, other):
@@ -189,7 +212,7 @@ class GalaxyImageSet:
     @property
     def files(self):
         """Read Only: Path of Files"""
-        return tuple(self._files)
+        return self._files
     
     @property
     def data(self):
@@ -275,8 +298,6 @@ class GalaxyImageSet:
             self._cutout_shape[galaxy][observatory] = {}
 
         self._cutout_shape[galaxy][observatory][band] = box_shape
-        
-        print(f"Set cutout_shape[{galaxy}][{observatory}][{band}] = {box_shape}")
         
     def summary(self):
         """Print summary of galaxies and available bands."""

@@ -2,7 +2,6 @@ import numpy as np
 from astropy.coordinates import SkyCoord
 from astroquery.ipac.ned import Ned
 from dustmaps.planck import PlanckQuery
-from pathlib import Path
 
 from ..handlers.filter_handler import Filters
 
@@ -30,7 +29,7 @@ class Reddening:
             print('Filter is not valid for CCM98 model')
             return 0
         
-        A_mean = self.median_reddening(wave, resp)
+        A_mean = self._calculate_mean_extinction(wave, resp)
         deredden_img = image_data * 10 ** (0.4 * A_mean)
         deredden_err = error_data * 10 ** (0.4 * A_mean)
         
@@ -202,37 +201,40 @@ class Reddening:
 
         return reddening_curve
 
-    def median_reddening(self, wavelength, response):
-            """
-            Compute the mean wavelength given arrays of wavelength (wavelength) and transmission (response).
+    def _calculate_mean_extinction(self, wavelength, response):
+        """
+        Compute the mean extinction over a bandpass.
 
-            Parameters
-            ----------
-            wavelength : array_like
-                Wavelengths (e.g., in Angstroms).
-            response : array_like
-                Filter transmission values corresponding to wavelength.
+        This calculates the response-weighted mean of the extinction A(λ)
+        over the given bandpass.
 
-            Returns
-            -------
-            lambda_mean : float
-                The mean wavelength.
-            """
-            # Ensure the inputs are numpy arrays
-            wavelength = np.asarray(wavelength)
-            response = np.asarray(response) / np.max(np.asarray(response))
-            
-            # Get reddening curve
-            red_curve = self.reddening_ccm(wavelength, ebv=self.ebv, a_v=None, r_v=3.1, model='ccm89')
-            A_lambda = 2.5 * np.log10(red_curve)
+        Parameters
+        ----------
+        wavelength : array_like
+            Wavelengths in Angstroms.
+        response : array_like
+            Filter transmission values corresponding to wavelength.
 
-            # Numerically integrate T(lambda)*lambda over lambda for the numerator
-            numerator = np.trapz(response * A_lambda, x=wavelength)
-            
-            # Numerically integrate response(lambda)/lambda over lambda for the denominator
-            denominator = np.trapz(response, x=wavelength)
-            
-            # Compute the pivot wavelength as the square root of the ratio
-            A_mean = numerator / denominator
-            return A_mean
+        Returns
+        -------
+        A_mean : float
+            The mean extinction in magnitudes for the given bandpass.
+        """
+        # Ensure the inputs are numpy arrays
+        wavelength = np.asarray(wavelength)
+        response = np.asarray(response)
         
+        # Get reddening curve (extinction in magnitudes for each wavelength)
+        red_curve_multiplier = self.reddening_ccm(wavelength, ebv=self.ebv, a_v=None, r_v=3.1, model='ccm89')
+        A_lambda = 2.5 * np.log10(red_curve_multiplier)
+
+        # Calculate response-weighted mean extinction:
+        # A_mean = integral(T(λ) * A(λ) dλ) / integral(T(λ) dλ)
+        numerator = np.trapezoid(response * A_lambda, x=wavelength)
+        denominator = np.trapezoid(response, x=wavelength)
+        
+        if denominator == 0:
+            return 0.0
+
+        A_mean = numerator / denominator
+        return A_mean

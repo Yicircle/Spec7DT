@@ -1,4 +1,3 @@
-from astropy.convolution import convolve, Gaussian2DKernel
 import numpy as np
 
 def interpolate_sky(image_data, galaxy_name, observatory, band, image_set):

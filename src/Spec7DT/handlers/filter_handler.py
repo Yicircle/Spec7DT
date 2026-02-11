@@ -83,7 +83,6 @@ class Filters:
             
             for filter_name in filterIDs:
                 cls._load_from_svo(cls, filter_name)
-            print("All Filters loaded")
                 
         except Exception as e:
             print(f"Warning: Could not load predefined filters: {str(e)}")
@@ -412,10 +411,10 @@ class Filters:
             'Spitzer.ch2': 'spitzer.irac.ch2',
             'Spitzer.ch3': 'spitzer.irac.ch3',
             'Spitzer.ch4': 'spitzer.irac.ch4',
-            'WISE.w1': 'wise.W1',
-            'WISE.w2': 'wise.W2',
-            'WISE.w3': 'wise.W3',
-            'WISE.w4': 'wise.W4',
+            'WISE.W1': 'wise.W1',
+            'WISE.W2': 'wise.W2',
+            'WISE.W3': 'wise.W3',
+            'WISE.W4': 'wise.W4',
             'F657N': 'HST.UVIS1.F657N',
             'F658N': 'HST.UVIS1.F658N',
             'PACS.blue': 'herschel.pacs.blue',

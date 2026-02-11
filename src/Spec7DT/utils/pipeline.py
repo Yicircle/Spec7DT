@@ -1,6 +1,9 @@
 import inspect
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime
+import pickle
 
 from ..plot.plot import DrawGalaxy
 
@@ -9,6 +12,7 @@ class ImageProcessingPipeline:
         self.galaxy_image_set = galaxy_image_set
         self.pipeline_steps = []
         self.step_configs = {}
+        self.starttime = datetime.now()
     
     def add_step(self, function, config=None, step_name=None):
         """파이프라인에 처리 단계 추가"""
@@ -31,18 +35,18 @@ class ImageProcessingPipeline:
         # 필터 조건에 맞는 이미지들을 선택
         
         for step in self.pipeline_steps:
-            targets = self._get_filtered_targets(galaxy_filter, observatory_filter, band_filter)
-            for galaxy, observatory, band, image, header, error in targets:
-                updated_image_set = self._execute_step(step, galaxy, observatory, band, image, header, error, verbose)
-                self.galaxy_image_set.data = (
-                    galaxy, observatory, band, 
-                    updated_image_set.data[galaxy][observatory][band]
-                )
-                self.galaxy_image_set.error = (
-                    galaxy, observatory, band,
-                    updated_image_set.error[galaxy][observatory][band]
-                )
+            # Use generator to process images one by one without holding all in memory
+            for galaxy, observatory, band, image, header, error in self._get_filtered_targets(galaxy_filter, observatory_filter, band_filter):
+                self._execute_step(step, galaxy, observatory, band, image, header, error, verbose)
+                
             if plot_step is not None:
+                print(f"Time lack: {datetime.now() - self.starttime}")
+                self.starttime = datetime.now()
+                
+                # with open(f"Galaxy_Set_{step['name']}.pkl", 'wb') as file:
+                #     pickle.dump(self.galaxy_image_set, file)
+                
+                
                 if isinstance(plot_step, dict):
                     if "band" in plot_step.keys():
                         DrawGalaxy.single_galaxy(self.galaxy_image_set, 
@@ -57,8 +61,6 @@ class ImageProcessingPipeline:
     
     def _get_filtered_targets(self, galaxy_filter, observatory_filter, band_filter):
         """필터 조건에 맞는 (galaxy, observatory, band) 조합 반환"""
-        targets = []
-        
         for galaxy in self.galaxy_image_set.data:
             if galaxy_filter and galaxy not in galaxy_filter:
                 continue
@@ -78,10 +80,7 @@ class ImageProcessingPipeline:
                     except:
                         target_error = np.zeros_like(target_image)
                     
-                    targets.append((galaxy, observatory, band,
-                                    target_image, target_header, target_error))
-        
-        return targets
+                    yield (galaxy, observatory, band, target_image, target_header, target_error)
     
     def _execute_step(self, step, galaxy, observatory, band, image, header, error, verbose):
         """Execute each step"""
@@ -100,7 +99,7 @@ class ImageProcessingPipeline:
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
         
         result = function(**filtered_kwargs)
-        print(f"✓ {step['name']} completed for {galaxy}/{observatory}/{band}")
+        print(f"✓ {step['name']} completed for {galaxy}/{observatory}/{band} {datetime.now() - self.starttime}")
         
         # try:
         #     result = function(**filtered_kwargs)
@@ -111,6 +110,7 @@ class ImageProcessingPipeline:
         return self.galaxy_image_set
 
 
+from ..reduction.registration import Register
 from .unit import conversion
 from ..reduction.background import backgroundSubtraction
 from ..reduction.PSF import PointSpreadFunction
@@ -122,13 +122,15 @@ from ..division.cutout import CutRegion
 
 from .file_generator import inputGenerator
 
-def execute_pipeline(galaxy_image_set, cat_type, processes={}, plot_step=False, verbose=False, manual_mask:dict=None, bin=1, box_size=None, cut_coeff=1.5):
+def execute_pipeline(galaxy_image_set, cat_type, processes={}, plot_step=False, verbose=False, trim_size=None, manual_mask:dict=None, bin=1, box_size=None, cut_coeff=1.5):
     if not processes:
         processes = {
-            "unit": True,
             "background": False,
             "psf": True,
             "psfconv": True,
+            "register": True,
+            "trim": True,
+            "unit": True,
             "dered": True,
             "mask": True,
             "skyinter": True,
@@ -139,33 +141,25 @@ def execute_pipeline(galaxy_image_set, cat_type, processes={}, plot_step=False, 
     
     pipeline1 = ImageProcessingPipeline(galaxy_image_set)
 
-    processes["unit"] and pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
-    processes["background"] and pipeline1.add_step(backgroundSubtraction) 
+    processes["background"] and pipeline1.add_step(backgroundSubtraction)
     processes["psf"] and pipeline1.add_step(PointSpreadFunction.extract, step_name="Extract PSF")
+    processes["psfconv"] and pipeline1.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
+    
+    processes["register"] and pipeline1.add_step(Register().save_all_progress, step_name="Save Progress")
+    processes["register"] and pipeline1.add_step(Register().swarp_register, step_name="SWarp Reigistration")
+    processes["trim"] and pipeline1.add_step(Register().trim, config={"trim_size" : trim_size}, step_name="Trimming")
+    processes["unit"] and pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
+    
+    processes["dered"] and pipeline1.add_step(Reddening().dered, step_name="Dereddening")
+    processes["mask"] and pipeline1.add_step(Masking.adapt_mask, config={"manual": manual_mask}, step_name="Masking")
+    processes["skyinter"] and pipeline1.add_step(interpolate_sky, step_name="Interpolate Masked Region")
+    processes["bin"] and pipeline1.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
+    
+    processes["cutout"] and pipeline1.add_step(CutRegion.get_shape, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Get Cutout Region")
+    
+    processes["cutout"] and pipeline1.add_step(CutRegion.cutout_region, step_name="Cutout Image")
     
     galaxy_image_set = pipeline1.execute(plot_step=plot_step, verbose=verbose)
-    
-    pipeline2 = ImageProcessingPipeline(galaxy_image_set)
-    
-    processes["psfconv"] and pipeline2.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
-    processes["dered"] and pipeline2.add_step(Reddening().dered, step_name="Dereddening")
-    processes["mask"] and pipeline2.add_step(Masking.adapt_mask, config={"manual": manual_mask}, step_name="Masking")
-    processes["skyinter"] and pipeline2.add_step(interpolate_sky, step_name="Interpolate Masked Region")
-    processes["bin"] and pipeline2.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
-    
-    galaxy_image_set = pipeline2.execute(plot_step=plot_step, verbose=verbose)
-    
-    pipeline3 = ImageProcessingPipeline(galaxy_image_set)
-    
-    processes["cutout"] and pipeline3.add_step(CutRegion.get_shape, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Get Cutout Region")
-    
-    galaxy_image_set = pipeline3.execute(plot_step=plot_step, verbose=verbose)
-    
-    pipeline4 = ImageProcessingPipeline(galaxy_image_set)
-    
-    processes["cutout"] and pipeline4.add_step(CutRegion.cutout_region, step_name="Cutout Image")
-    
-    galaxy_image_set = pipeline4.execute(plot_step=plot_step, verbose=verbose)
     
     input_df = inputGenerator.dataframe_generator(galaxy_image_set, cat_type)
     return input_df

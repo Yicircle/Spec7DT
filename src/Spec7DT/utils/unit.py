@@ -53,8 +53,8 @@ class conversion:
             convert_im, convert_err = conversion_func(image_data, header, band), conversion_func(error_data, header, band)
             convert_im = np.nan_to_num(convert_im, nan=0.0)
             
-            image_set.update_data(convert_im, galaxy_name, observatory, band)
-            image_set.update_error(convert_err, galaxy_name, observatory, band)
+            image_set.update_data(convert_im.astype(np.float32), galaxy_name, observatory, band)
+            image_set.update_error(convert_err.astype(np.float32), galaxy_name, observatory, band)
                 
         except Exception as e:
             print(f"Error converting data for {galaxy_name} from {observatory} {band}: {str(e)}")
@@ -85,9 +85,7 @@ class conversion:
             ZP = header['ZP_AUTO']
         except KeyError:
             raise KeyError("Zero Point value is not found.")
-        mag = -2.5 * np.log10(image_data) + ZP
-        flux = 10 ** (-0.4 * (mag - 8.90)) * 1e3
-        # flux = 3631 * (image_data) * 10 ** (-ZP / 2.5) * 1e3
+        flux = image_data * 10 ** (-0.4 * (ZP - 8.90)) * 1e3
         return flux
 
     def PanStarr1(self, image_data, header, band=None):
@@ -119,6 +117,8 @@ class conversion:
                 'w3': 18.0,
                 'w4': 13.0
                 }
+        
+        band = band.lower()
 
         image_data = np.where(image_data == 0, 0.1, image_data)
         image_data = np.where(np.isnan(image_data), 0.1, image_data)
@@ -146,7 +146,5 @@ class conversion:
     def pacs(self, image_data, header=None, band=None):  # Jy/pixel
         return 1e3 * image_data
     
-    def spire(self, image_data, header=None, band=None):  # MJy/sr
-        pixel_scale = useful_functions.get_pixel_scale(header, typical=0.0017222222)
-        # return 1e9 * ((pixel_scale / 206265.0) ** 2) * image_data
+    def spire(self, image_data, header=None, band=None):  # Jy/pixel
         return 1e3 * image_data

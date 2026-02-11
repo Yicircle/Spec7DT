@@ -16,7 +16,6 @@ class CutRegion:
     @classmethod
     def cutout_region(cls, image_data, error_data, galaxy_name, observatory, band, image_set):
         cuts = useful_functions.extract_values_recursive(image_set.cutout_shape, galaxy_name)
-        print(cuts)
         box_size = np.median(np.array(cuts), axis=0)
         
         cut_img, cut_error = cls.get_cutout_image(image_data, error_data, box_size, 'ellipse')

@@ -1,10 +1,5 @@
 import numpy as np
 import math
-import inspect
-import shutil
-from pathlib import Path
-from typing import Union, Tuple, Dict, List, Optional
-from dataclasses import dataclass
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from photutils.segmentation import detect_threshold, detect_sources, SourceCatalog
@@ -25,7 +20,7 @@ class Observatories:
     
     def _infrareds(self):
         """Return a list of infrared observatories."""
-        return ['WISE', 'Spitzer', 'Herschel', 'JWST', 'VISTA', 'UKIDSS', '2MASS', 'SPHEREx', 'PACS', 'SPIRE']
+        return ['WISE', 'Spitzer', 'IRAC', 'MIPS', 'Herschel', 'JWST', 'VISTA', 'UKIDSS', '2MASS', 'SPHEREx', 'PACS', 'SPIRE']
     
     def _ultraviolet(self):
         """Return a list of ultraviolet observatories."""
@@ -102,6 +97,17 @@ class useful_functions:
         return x0, y0, a, b, theta
     
     @staticmethod
+    def get_sky_loc(location):
+        from astropy.coordinates import SkyCoord
+        from astroquery.ipac.ned import Ned
+        
+        if isinstance(location, str):
+            ra, dec = Ned.query_object(location)['RA', 'DEC'][0]
+            
+        sky_loc = SkyCoord(ra=ra, dec=dec, unit="deg")
+        return sky_loc
+    
+    @staticmethod
     def find_rec(N):
         # Start from the square root of N and work downwards
         num_found = False
@@ -121,7 +127,6 @@ class useful_functions:
         cd1_1 = np.abs(header.get("CD1_1", header.get("PC1_1", header.get("CDELT1", typical))))
         cd1_2 = np.abs(header.get("CD1_2", header.get("PC1_2", 0.00)))
         pixel_scale = 3600 * np.sqrt(cd1_1 ** 2 + cd1_2 ** 2)
-        print(pixel_scale, header.get("DATE-OBS", ""))
         return pixel_scale
     
     @staticmethod
@@ -426,3 +431,34 @@ class useful_functions:
                     shrinkB=0))
         ax.text(x, y + size_pix * 0.3, scale_text, color=color,
                 fontsize=7, fontweight='bold', ha='center', va='center')
+        
+        
+    @classmethod
+    def update_header(cls, ori_header, new_header):
+        """
+        Update original header with new header information.
+        Preserves all original header information and replaces/adds values from new_header.
+        
+        Parameters
+        ----------
+        ori_header : astropy.io.fits.Header
+            Original header to be updated
+        new_header : astropy.io.fits.Header
+            Header containing new/updated values
+        
+        Returns
+        -------
+        astropy.io.fits.Header
+            Updated original header with new values merged in
+        """
+        # Create a copy to avoid modifying the original
+        matrix_keys = ["CD", "PC", "CDELT", "PV"]
+        
+        updated_header = ori_header.copy()
+        
+        # Update with new header values
+        for key in new_header:
+            if (key != "COMMENT") or any(matrix in key for matrix in matrix_keys):
+                updated_header[key] = new_header[key]
+        
+        return updated_header

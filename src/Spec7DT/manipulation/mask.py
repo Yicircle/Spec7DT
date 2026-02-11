@@ -27,7 +27,7 @@ class Masking:
             image_set.psf = (galaxy_name, "max", sig_t)
             
         fwhm = image_set.psf[galaxy_name]["max"]  # in "
-        pixel_scale = np.abs(header.get("CD1_1", 1.1e-4)) * 3600
+        pixel_scale = useful_functions.get_pixel_scale(header)
         fwhm = fwhm / pixel_scale  # in pixel
         
         mask_image, masked_image, _ = cls.make_mask(cls, image_data, header, galaxy_name, fwhm, manual)
@@ -58,10 +58,11 @@ class Masking:
         
         wcs = WCS(header)
         mask = np.zeros_like(image)
+        pixel_scale = useful_functions.get_pixel_scale(header)
         
         for coord, rad in zip(coords, rads):
             star_loc = wcs.all_world2pix(coord[0], coord[1], 0)
-            star_mask = CircularAperture(positions=star_loc, r=rad).to_mask().to_image(shape=image.shape)
+            star_mask = CircularAperture(positions=star_loc, r=rad/pixel_scale).to_mask().to_image(shape=image.shape)
             if star_mask is None:
                 continue
             star_mask = np.where(star_mask > 0, 0, 1)
@@ -86,15 +87,17 @@ class Masking:
         try:
             segment_map.remove_label(label=int(segment_map.data[int(y), int(x)]), relabel=True)
         except Exception as e:
-            print(e)
-            print("Un-removed")
             pass
         
-        checksum = np.sum(np.where(segment_map.data != 0, 0, 1))
-        if checksum != 0:
-            masked_image = np.where(segment_map.data == 0, image, np.nan)
-        else:
+        if segment_map is None:
             masked_image = image
+            return np.zeros_like(masked_image), masked_image, np.full_like(masked_image, fill_value=median)
+        else:
+            checksum = np.sum(np.where(segment_map.data != 0, 0, 1))
+            if checksum != 0:
+                masked_image = np.where(segment_map.data == 0, image, np.nan)
+            else:
+                masked_image = image
         
         return np.where(segment_map.data == 0, False, True), masked_image, np.full_like(masked_image, fill_value=median)
     
