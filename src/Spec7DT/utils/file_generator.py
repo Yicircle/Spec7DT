@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 from .utility import useful_functions
-from ..handlers.filter_handler import Filters
+from ..handlers.catalog_adapters import get_catalog_columns
 
 class inputGenerator:
     def __init__(self):
@@ -52,7 +52,7 @@ class inputGenerator:
         
         df = df.astype({'id': 'str'})
         
-        colnames = Filters.get_catcols(cat_type, float_cols)
+        colnames = get_catalog_columns(cat_type, float_cols)
         df.rename(columns=colnames, inplace=True)
         
         df.reset_index(drop=True, inplace=True)

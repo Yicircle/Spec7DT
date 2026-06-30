@@ -3,13 +3,14 @@ from pathlib import Path
 from typing import Optional, Union, Dict, Tuple
 import numpy as np
 from importlib import resources
-import inspect
+import warnings
 
 from .filter_properties import (
     FilterProperties,
     FilterPropertyCalculator,
     prepare_filter_curve,
 )
+from .catalog_adapters import get_catalog_columns
 
 
 def _get_svo_fps():
@@ -380,6 +381,21 @@ class Filters:
             matches.append(key)
 
         return matches
+
+    @classmethod
+    def resolve_name(cls, name: str,
+                     facility: Optional[str] = None,
+                     instrument: Optional[str] = None) -> str:
+        """Return the canonical registered filter name for a lookup query."""
+        if name is None:
+            raise ValueError("Filter name must be provided")
+
+        matches = cls._matching_filter_keys(name, facility=facility, instrument=instrument)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise KeyError(f"Filter '{name}' is ambiguous. Matches: {matches}")
+        raise KeyError(f"Filter '{name}' not found. Available: {cls.list_filters()}")
     
     @classmethod
     def get_filter_curve(cls, name: str = None, 
@@ -417,16 +433,7 @@ class Filters:
         Returns:
             FilterCurve object
         """
-        if name is None:
-            raise ValueError("Filter name must be provided")
-
-        matches = cls._matching_filter_keys(name, facility=facility, instrument=instrument)
-        if len(matches) == 1:
-            return cls._filters[matches[0]]
-        if len(matches) > 1:
-            raise KeyError(f"Filter '{name}' is ambiguous. Matches: {matches}")
-
-        raise KeyError(f"Filter '{name}' not found. Available: {cls.list_filters()}")
+        return cls._filters[cls.resolve_name(name, facility=facility, instrument=instrument)]
     
     @classmethod
     def get_all_filters(cls):
@@ -461,79 +468,53 @@ class Filters:
     
     @classmethod
     def get_catcols(cls, cat_type, col_names):
-        """Return a dictionary of given type"""
-        catcols ={"cigale": cls.cigale,
-                  "eazy": cls.eazy,
-                  "lephare": cls.lephare,
-                  "ppxf": cls.ppxf,
-                  "goyangyi": cls.goyangyi
-                  }
-        
-        function = catcols[cat_type.lower()]
-        sig = inspect.signature(function)
-        
-        # image_data, header, error_data, galaxy_name, observatory, band, image_set
-        kwargs = {"self": cls, "col_names": col_names}
-        
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return function(**filtered_kwargs)
+        """Backward-compatible catalog adapter lookup."""
+        warnings.warn(
+            "Filters.get_catcols() is deprecated; use "
+            "Spec7DT.handlers.catalog_adapters.get_catalog_columns() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return get_catalog_columns(cat_type, col_names)
     
     
     def cigale(self):
-        cols_cigale = {
-            'GALEX.NUV': 'galex.NUV',
-            'GALEX.FUV': 'galex.FUV',
-            'SDSS.u': 'sloan.sdss.u',
-            'SDSS.g': 'sloan.sdss.g',
-            'SDSS.r': 'sloan.sdss.r',
-            'SDSS.i': 'sloan.sdss.i',
-            'SDSS.z': 'sloan.sdss.z',
-            'PanStarrs.y': 'PAN-STARRS_y',
-            '2MASS.J': 'J_2mass',
-            '2MASS.H': 'H_2mass',
-            '2MASS.Ks': 'Ks_2mass',
-            'Spitzer.ch1': 'spitzer.irac.ch1',
-            'Spitzer.ch2': 'spitzer.irac.ch2',
-            'Spitzer.ch3': 'spitzer.irac.ch3',
-            'Spitzer.ch4': 'spitzer.irac.ch4',
-            'WISE.W1': 'wise.W1',
-            'WISE.W2': 'wise.W2',
-            'WISE.W3': 'wise.W3',
-            'WISE.W4': 'wise.W4',
-            'F657N': 'HST.UVIS1.F657N',
-            'F658N': 'HST.UVIS1.F658N',
-            'PACS.blue': 'herschel.pacs.blue',
-            'PACS.green': 'herschel.pacs.green',
-            'PACS.red': 'herschel.pacs.red',
-            'SPIRE.PSW': 'herschel.spire.PSW',
-            'SPIRE.PMW': 'herschel.spire.PMW',
-            'SPIRE.PLW': 'herschel.spire.PLW',
-        }
-        cols_cigale.update({f'{key}_err': f'{cols_cigale[key]}_err' for key in cols_cigale.keys() if '_err' not in key})
-        return cols_cigale
+        warnings.warn(
+            "Filters.cigale() is deprecated; use catalog_adapters.cigale_columns().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return get_catalog_columns("cigale")
     
     def eazy(self, col_names):
-        flux_dict = {name:f"F_{name}" for name in col_names if "_err" not in name}
-        err_dict = {name:f"E_{name.strip('_err')}" for name in col_names if "_err" in name}
-        flux_dict.update(err_dict)
-        
-        cols_eazy = flux_dict
-        return cols_eazy
+        warnings.warn(
+            "Filters.eazy() is deprecated; use catalog_adapters.eazy_columns().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return get_catalog_columns("eazy", col_names)
     
     def lephare(self):
-        cols_lephare = {
-            
-        }
-        return cols_lephare
+        warnings.warn(
+            "Filters.lephare() is deprecated; use catalog_adapters.lephare_columns().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return get_catalog_columns("lephare")
     
     def ppxf(self):
-        cols_ppxf = {
-            
-        }
-        return cols_ppxf
+        warnings.warn(
+            "Filters.ppxf() is deprecated; use catalog_adapters.ppxf_columns().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return get_catalog_columns("ppxf")
     
     
     def goyangyi(self):
-        cols_cigale = self.cigale(self)
-        print(" ╱|、\n(˚ˎ 。7  \n |、˜〵          \n じしˍ,)ノ")
-        return cols_cigale
+        warnings.warn(
+            "Filters.goyangyi() is deprecated; use catalog_adapters.get_catalog_columns().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return get_catalog_columns("goyangyi")

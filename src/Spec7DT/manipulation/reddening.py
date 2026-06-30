@@ -9,9 +9,6 @@ class Reddening:
     def __init__(self):
         from dustmaps.config import config
         config.reset()
-        
-        import dustmaps.planck
-        dustmaps.planck.fetch()
         self.filter_inst = Filters()
     
     def dered(self, image_data, error_data, galaxy_name, observatory, band, image_set):

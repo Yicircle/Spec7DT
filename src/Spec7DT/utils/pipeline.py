@@ -2,6 +2,7 @@ import inspect
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
 from datetime import datetime
 import pickle
 
@@ -123,42 +124,73 @@ from ..division.cutout import CutRegion
 
 from .file_generator import inputGenerator
 
-def execute_pipeline(galaxy_image_set, cat_type, processes={}, plot_step=False, verbose=False, trim_size=None, manual_mask:dict=None, bin=1, box_size=None, cut_coeff=1.5):
-    if not processes:
-        processes = {
-            "background": False,
-            "psf": True,
-            "psfconv": True,
-            "register": True,
-            "trim": True,
-            "unit": True,
-            "dered": True,
-            "mask": True,
-            "skyinter": True,
-            "bin": True,
-            "cutout": True
-        }
+@dataclass
+class PipelineConfig:
+    background: bool = False
+    psf: bool = True
+    psfconv: bool = True
+    register: bool = True
+    trim: bool = True
+    unit: bool = True
+    dered: bool = True
+    mask: bool = True
+    skyinter: bool = True
+    bin: bool = True
+    cutout: bool = True
+    extras: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_processes(cls, processes=None):
+        if isinstance(processes, cls):
+            return processes
+        if not processes:
+            return cls()
+        known = {field_name for field_name in cls.__dataclass_fields__ if field_name != "extras"}
+        values = {key: bool(value) for key, value in processes.items() if key in known}
+        extras = {key: value for key, value in processes.items() if key not in known}
+        return cls(**values, extras=extras)
+
+    def enabled(self, name):
+        if hasattr(self, name):
+            return bool(getattr(self, name))
+        return bool(self.extras.get(name, False))
+
+
+def execute_pipeline(
+    galaxy_image_set,
+    cat_type,
+    processes=None,
+    plot_step=False,
+    verbose=False,
+    trim_size=None,
+    manual_mask: dict = None,
+    bin=1,
+    box_size=None,
+    cut_coeff=1.5,
+    config: PipelineConfig = None,
+):
+    pipeline_config = PipelineConfig.from_processes(config if config is not None else processes)
     
     
     pipeline1 = ImageProcessingPipeline(galaxy_image_set)
 
-    processes["background"] and pipeline1.add_step(backgroundSubtraction)
-    processes["psf"] and pipeline1.add_step(PointSpreadFunction.extract, step_name="Extract PSF")
-    processes["psfconv"] and pipeline1.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
+    pipeline_config.enabled("background") and pipeline1.add_step(backgroundSubtraction)
+    pipeline_config.enabled("psf") and pipeline1.add_step(PointSpreadFunction.extract, step_name="Extract PSF")
+    pipeline_config.enabled("psfconv") and pipeline1.add_step(PointSpreadFunction.convolution, step_name="Convolve with PSF")
     
-    processes["register"] and pipeline1.add_step(Register().save_all_progress, step_name="Save Progress")
-    processes["register"] and pipeline1.add_step(Register().swarp_register, step_name="SWarp Reigistration")
-    processes["trim"] and pipeline1.add_step(Register().trim, config={"trim_size" : trim_size}, step_name="Trimming")
-    processes["unit"] and pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
+    pipeline_config.enabled("register") and pipeline1.add_step(Register().save_all_progress, step_name="Save Progress")
+    pipeline_config.enabled("register") and pipeline1.add_step(Register().swarp_register, step_name="SWarp Reigistration")
+    pipeline_config.enabled("trim") and pipeline1.add_step(Register().trim, config={"trim_size" : trim_size}, step_name="Trimming")
+    pipeline_config.enabled("unit") and pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
     
-    processes["dered"] and pipeline1.add_step(Reddening().dered, step_name="Dereddening")
-    processes["mask"] and pipeline1.add_step(Masking.adapt_mask, config={"manual": manual_mask}, step_name="Masking")
-    processes["skyinter"] and pipeline1.add_step(interpolate_sky, step_name="Interpolate Masked Region")
-    processes["bin"] and pipeline1.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
+    pipeline_config.enabled("dered") and pipeline1.add_step(Reddening().dered, step_name="Dereddening")
+    pipeline_config.enabled("mask") and pipeline1.add_step(Masking.adapt_mask, config={"manual": manual_mask}, step_name="Masking")
+    pipeline_config.enabled("skyinter") and pipeline1.add_step(interpolate_sky, step_name="Interpolate Masked Region")
+    pipeline_config.enabled("bin") and pipeline1.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
     
-    processes["cutout"] and pipeline1.add_step(CutRegion.get_shape, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Get Cutout Region")
+    pipeline_config.enabled("cutout") and pipeline1.add_step(CutRegion.get_shape, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Get Cutout Region")
     
-    processes["cutout"] and pipeline1.add_step(CutRegion.cutout_region, step_name="Cutout Image")
+    pipeline_config.enabled("cutout") and pipeline1.add_step(CutRegion.cutout_region, step_name="Cutout Image")
     
     galaxy_image_set = pipeline1.execute(plot_step=plot_step, verbose=verbose)
     
