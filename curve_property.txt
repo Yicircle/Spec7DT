@@ -1,0 +1,185 @@
+class CurveProp:
+    
+    def pivot_wavelength(wavelength, response):
+        """
+        Compute the pivot wavelength given arrays of wavelength (wavelength) and transmission (response).
+
+        Parameters
+        ----------
+        wavelength : array_like
+            Wavelengths (e.g., in Angstroms).
+        response : array_like
+            Filter transmission values corresponding to wavelength.
+
+        Returns
+        -------
+        lambda_pivot : float
+            The pivot wavelength.
+        """
+        # Ensure the inputs are numpy arrays
+        wavelength = np.asarray(wavelength)
+        response = np.asarray(response)
+
+        # Numerically integrate response(lambda)*lambda over lambda for the numerator
+        numerator = np.trapz(response * wavelength, x=wavelength)
+        
+        # Numerically integrate response(lambda)/lambda over lambda for the denominator
+        denominator = np.trapz(response / wavelength, x=wavelength)
+        
+        # Compute the pivot wavelength as the square root of the ratio
+        lambda_pivot = np.sqrt(numerator / denominator)
+        return lambda_pivot
+
+
+    def mean_wavelength(wavelength, response):
+        """
+        Compute the mean wavelength given arrays of wavelength (wavelength) and transmission (response).
+
+        Parameters
+        ----------
+        wavelength : array_like
+            Wavelengths (e.g., in Angstroms).
+        response : array_like
+            Filter transmission values corresponding to wavelength.
+
+        Returns
+        -------
+        lambda_mean : float
+            The mean wavelength.
+        """
+        # Ensure the inputs are numpy arrays
+        wavelength = np.asarray(wavelength)
+        response = np.asarray(response)
+
+        # Numerically integrate T(lambda)*lambda over lambda for the numerator
+        numerator = np.trapz(response * wavelength, x=wavelength)
+        
+        # Numerically integrate response(lambda)/lambda over lambda for the denominator
+        denominator = np.trapz(response, x=wavelength)
+        
+        # Compute the pivot wavelength as the square root of the ratio
+        lambda_mean = numerator / denominator
+        return lambda_mean
+    
+    def peak_wavelength(wavelength, response):
+        """
+        Compute the peak wavelength given arrays of wavelength (wavelength) and transmission (response).
+
+        Parameters
+        ----------
+        wavelength : array_like
+            Wavelengths (e.g., in Angstroms).
+        response : array_like
+            Filter transmission values corresponding to wavelength.
+
+        Returns
+        -------
+        lambda_peak : float
+            The peak wavelength.
+        """
+        # Ensure the inputs are numpy arrays
+        wavelength = np.asarray(wavelength)
+        response = np.asarray(response)
+        
+        # Get peak index
+        index_peak = np.argmax(response)
+        
+        # Get wavelength at peak of response
+        lambda_peak = wavelength[index_peak]
+        
+        return lambda_peak
+    
+    
+    def center_wavelength(wavelength, response):
+        """
+        Compute the central wavelength as the midpoint between the two wavelengths
+        at half maximum (FWHM) of a response curve.
+        
+        Parameters
+        ----------
+        wavelength : 1D array
+            Wavelength values.
+        response : 1D array
+            Response values corresponding to each wavelength.
+            
+        Returns
+        -------
+        central_wave : float
+            The central wavelength between the two FWHM points.
+        """
+        # Determine half maximum
+        half_max = np.max(response) / 2.0
+
+        # Compute the difference between the response and half_max
+        diff = response - half_max
+        
+        # Find indices where the sign of diff changes (i.e. crossings)
+        crossing_indices = np.where(np.diff(np.sign(diff)) != 0)[0]
+        
+        if len(crossing_indices) < 2:
+            raise ValueError("Not enough crossing points found for FWHM calculation.")
+
+        # For FWHM, assume the first crossing is on the rising edge
+        # and the last crossing is on the falling edge.
+        # Use linear interpolation to estimate the crossing wavelengths.
+        
+        # Rising edge interpolation
+        i1 = crossing_indices[0]
+        # Linear interpolation:
+        # wavelength_cross = wavelength[i1] + (wavelength[i1+1]-wavelength[i1]) * (half_max - response[i1]) / (response[i1+1]-response[i1])
+        lambda1 = wavelength[i1] + (wavelength[i1+1] - wavelength[i1]) * (half_max - response[i1]) / (response[i1+1] - response[i1])
+        
+        # Falling edge interpolation
+        i2 = crossing_indices[-1]
+        lambda2 = wavelength[i2] + (wavelength[i2+1] - wavelength[i2]) * (half_max - response[i2]) / (response[i2+1] - response[i2])
+        
+        # The central wavelength is the average of these two wavelengths.
+        central_wave = (lambda1 + lambda2) / 2.0
+        return central_wave
+    
+    def FWHM(wavelength, response):
+        """
+        Compute the central wavelength as the midpoint between the two wavelengths
+        at half maximum (FWHM) of a response curve.
+        
+        Parameters
+        ----------
+        wavelength : 1D array
+            Wavelength values.
+        response : 1D array
+            Response values corresponding to each wavelength.
+            
+        Returns
+        -------
+        FWHM : float
+            The FWHM(Full Width Half Maximum) of the response curve.
+        """
+        # Determine half maximum
+        half_max = np.max(response) / 2.0
+
+        # Compute the difference between the response and half_max
+        diff = response - half_max
+        
+        # Find indices where the sign of diff changes (i.e. crossings)
+        crossing_indices = np.where(np.diff(np.sign(diff)) != 0)[0]
+        
+        if len(crossing_indices) < 2:
+            raise ValueError("Not enough crossing points found for FWHM calculation.")
+
+        # For FWHM, assume the first crossing is on the rising edge
+        # and the last crossing is on the falling edge.
+        # Use linear interpolation to estimate the crossing wavelengths.
+        
+        # Rising edge interpolation
+        i1 = crossing_indices[0]
+        # Linear interpolation:
+        # wavelength_cross = wavelength[i1] + (wavelength[i1+1]-wavelength[i1]) * (half_max - response[i1]) / (response[i1+1]-response[i1])
+        lambda1 = wavelength[i1] + (wavelength[i1+1] - wavelength[i1]) * (half_max - response[i1]) / (response[i1+1] - response[i1])
+        
+        # Falling edge interpolation
+        i2 = crossing_indices[-1]
+        lambda2 = wavelength[i2] + (wavelength[i2+1] - wavelength[i2]) * (half_max - response[i2]) / (response[i2+1] - response[i2])
+        
+        # The central wavelength is the average of these two wavelengths.
+        FWHM = np.abs(lambda1 - lambda2)
+        return FWHM

@@ -2,12 +2,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, Dict, Tuple
 import numpy as np
-from astroquery.svo_fps import SvoFps
-from astropy import units as u
 from importlib import resources
 import inspect
 
-from ..utils.utility import Observatories
+from .filter_properties import (
+    FilterProperties,
+    FilterPropertyCalculator,
+    prepare_filter_curve,
+)
+
+
+def _get_svo_fps():
+    """Import SVO only when a network-backed filter lookup is requested."""
+    try:
+        from astroquery.svo_fps import SvoFps
+    except ImportError as exc:
+        raise ImportError("astroquery is required to load filters from SVO") from exc
+    return SvoFps
+
 
 @dataclass
 class FilterCurve:
@@ -15,18 +27,55 @@ class FilterCurve:
     name: str
     wavelength: np.ndarray
     response: np.ndarray
-    source_type: str  # 'default', 'file', 'array'
+    source_type: str  # 'default', 'file', 'array', or 'svo'
     source_path: Optional[str] = None
     unit_type: str = 'photon'  # 'photon' or 'energy'
     description: str = ''
     
     def __post_init__(self):
         """Validate and convert arrays to numpy."""
-        self.wavelength = np.asarray(self.wavelength)
-        self.response = np.asarray(self.response)
-        
-        if len(self.wavelength) != len(self.response):
-            raise ValueError("Wavelength and response arrays must have same length")
+        self.wavelength, self.response = prepare_filter_curve(
+            self.wavelength,
+            self.response,
+            require_positive_response=False,
+        )
+
+        if self.unit_type not in {'photon', 'energy'}:
+            raise ValueError("unit_type must be either 'photon' or 'energy'")
+
+    def get_properties(self) -> FilterProperties:
+        """Calculate all supported properties for this filter curve."""
+        return FilterPropertyCalculator.calculate(self.wavelength, self.response)
+
+    @property
+    def properties(self) -> FilterProperties:
+        """Calculated filter response properties."""
+        return self.get_properties()
+
+    @property
+    def pivot_wavelength(self) -> float:
+        """Pivot wavelength of the response curve."""
+        return FilterPropertyCalculator.pivot_wavelength(self.wavelength, self.response)
+
+    @property
+    def mean_wavelength(self) -> float:
+        """Response-weighted mean wavelength."""
+        return FilterPropertyCalculator.mean_wavelength(self.wavelength, self.response)
+
+    @property
+    def peak_wavelength(self) -> float:
+        """Wavelength at maximum response."""
+        return FilterPropertyCalculator.peak_wavelength(self.wavelength, self.response)
+
+    @property
+    def center_wavelength(self) -> float:
+        """Center wavelength based on half-maximum crossings."""
+        return FilterPropertyCalculator.center_wavelength(self.wavelength, self.response)
+
+    @property
+    def fwhm(self) -> float:
+        """Full width at half maximum."""
+        return FilterPropertyCalculator.fwhm(self.wavelength, self.response)
     
     def save_to_file(self, filepath: Union[str, Path]):
         """Save filter curve to ASCII .dat file with proper header format."""
@@ -53,41 +102,38 @@ class FilterCurve:
 class Filters:
     """Manages astronomical filter transmission curves from multiple sources."""
     _filters: Dict[str, FilterCurve] = {}
-    _index = SvoFps.get_filter_index(1e-4*u.um, 600*u.um, timeout=12000).to_pandas()
+    _predefined_loaded: bool = False
     
     def __init__(self):
-        """Initialize and auto-load predefined filters from package resources."""
+        """Initialize and load package-bundled filter curves."""
         self._load_predefined_filters()
     
     @classmethod
     def _load_predefined_filters(cls):
         """Load all .dat files from package filter_curves directory."""
+        if cls._predefined_loaded:
+            return
+
         try:
-            # from files
             filter_dir = resources.files("Spec7DT.reference.filter_curves")
             for filepath in filter_dir.iterdir():
                 if filepath.name.endswith('.dat'):
                     try:
-                        # Read file content directly using as_file context manager
                         with resources.as_file(filepath) as file_path:
-                            cls._load_from_file(cls, file_path)
+                            cls._load_from_file(file_path, source_type='default')
                     except Exception as e:
                         print(f"Warning: Failed to load {filepath.name}: {str(e)}")
-            
-            # from SVO
-            
-            obs = Observatories.get_observatories()
-            mask_index = cls._index[["Facility", "Instrument"]].isin(obs)
-            mask_index = (mask_index["Facility"] | mask_index["Instrument"])
-            filterIDs = cls._index[mask_index]["filterID"].to_numpy()
-            
-            for filter_name in filterIDs:
-                cls._load_from_svo(cls, filter_name)
-                
+            cls._predefined_loaded = True
         except Exception as e:
             print(f"Warning: Could not load predefined filters: {str(e)}")
     
-    def _load_from_file(self, filepath: Union[str, Path], name: Optional[str] = None):
+    @classmethod
+    def _load_from_file(
+        cls,
+        filepath: Union[str, Path],
+        name: Optional[str] = None,
+        source_type: str = 'file',
+    ):
         """
         Protected method: Load filter from ASCII file.
         Expected format: header lines starting with '#', then wavelength-response columns.
@@ -96,24 +142,21 @@ class Filters:
         if not filepath.exists():
             raise FileNotFoundError(f"Filter file not found: {filepath}")
         
-        # Read file and parse header/data
         with open(filepath, 'r') as f:
             lines = f.readlines()
         
-        # Parse header (lines starting with #)
-        header = [line.strip('# \n') for line in lines if line.startswith('#')]
+        header = [line[1:].strip() for line in lines if line.startswith('#')]
         filter_name = header[0] if len(header) > 0 else filepath.stem
-        unit_type = header[1] if len(header) > 1 else 'photon'
+        unit_type = header[1].lower() if len(header) > 1 else 'photon'
         description = header[2] if len(header) > 2 else ''
         
-        # Parse data (non-comment lines)
-        data_lines = [line.strip() for line in lines if not line.startswith('#') and line.strip()]
-        data = np.array([list(map(float, line.split())) for line in data_lines])
+        data = np.loadtxt(filepath, comments='#', ndmin=2)
+        if data.ndim != 2 or data.shape[1] < 2:
+            raise ValueError("Filter file must contain wavelength and response columns")
         
         wavelength = data[:, 0]
         response = data[:, 1]
         
-        # Create FilterCurve object
         if name:
             filter_name = name
         
@@ -121,15 +164,16 @@ class Filters:
             name=filter_name,
             wavelength=wavelength,
             response=response,
-            source_type='file',
+            source_type=source_type,
             source_path=str(filepath),
             unit_type=unit_type,
             description=description
         )
          
-        self._filters[filter_name] = curve
+        cls._filters[filter_name] = curve
     
-    def _load_from_svo(self, filter_id: str, name: Optional[str] = None):
+    @classmethod
+    def _load_from_svo(cls, filter_id: str, name: Optional[str] = None):
         """
         Protected method: Load filter from SVO Filter Profile Service.
         
@@ -137,41 +181,45 @@ class Filters:
             filter_id: SVO filter identifier (e.g., 'SLOAN/SDSS.u', '2MASS/2MASS.J')
             name: Optional custom name. If None, uses filter_id as name
         """
+        SvoFps = _get_svo_fps()
         try:
-            # Query SVO for filter transmission data
             data = SvoFps.get_transmission_data(filter_id)
-            
-            # Extract wavelength and transmission
             wavelength = data['Wavelength'].to('angstrom').value
             transmission = data['Transmission'].value
-            
-            # Get filter metadata
+
             facility_name = filter_id.split("/")[0]
-            meta = SvoFps.get_filter_list(facility=facility_name).to_pandas()
-            meta = meta[meta['filterID'] == filter_id].reset_index(drop=True)
-            description = f"{meta.loc[0, 'Description']}"
-            unit_type = "photon" if int(meta.loc[0, 'DetectorType']) else "energy"
-            
-            # Create FilterCurve object
+            description = ''
+            unit_type = 'photon'
+
+            try:
+                meta = SvoFps.get_filter_list(facility=facility_name).to_pandas()
+                meta = meta[meta['filterID'] == filter_id].reset_index(drop=True)
+                if len(meta) > 0:
+                    description = f"{meta.loc[0, 'Description']}"
+                    unit_type = "photon" if int(meta.loc[0, 'DetectorType']) else "energy"
+            except Exception:
+                pass
+
             filter_name = name if name else filter_id
             curve = FilterCurve(
                 name=filter_name,
                 wavelength=wavelength,
                 response=transmission,
-                source_type='default',
+                source_type='svo',
                 source_path="SVO Filter Service Web",
                 unit_type=unit_type,
                 description=description
             )
             
-            self._filters[filter_name] = curve
+            cls._filters[filter_name] = curve
             
         except Exception as e:
             raise ValueError(f"Failed to load SVO filter '{filter_id}': {str(e)}")
     
-    def _search_svo_filter(self, facility: Optional[str] = None, 
-                          instrument: Optional[str] = None, 
-                          filter_name: Optional[str] = None) -> str:
+    @classmethod
+    def _search_svo_filter(cls, facility: Optional[str] = None,
+                           instrument: Optional[str] = None,
+                           filter_name: Optional[str] = None) -> str:
         """
         Search SVO database for filter ID using flexible naming.
         
@@ -191,7 +239,7 @@ class Filters:
         if instrument:
             query_params['instrument'] = instrument
         
-        # Query SVO filter list
+        SvoFps = _get_svo_fps()
         try:
             filter_list = SvoFps.get_filter_list(**query_params)
         except IndexError:
@@ -202,14 +250,12 @@ class Filters:
         if len(filter_list) == 0:
             raise ValueError(f"No filters found for {query_params}")
         
-        # If filter_name specified, search for it in filterID field
         if filter_name:
             filter_name_lower = filter_name.lower()
             matches = []
             
             for row in filter_list:
                 filter_id = row['filterID']
-                # Extract last part after final dot or slash
                 band = filter_id.split('.')[-1].split('/')[-1].lower()
                 
                 if band == filter_name_lower or filter_name_lower in band:
@@ -226,7 +272,6 @@ class Filters:
             
             return matches[0]
         else:
-            # No filter name - return first result
             return filter_list[0]['filterID']
     
     @classmethod
@@ -255,22 +300,19 @@ class Filters:
         source_str = str(source).lower()
         
         if source_str == 'svo':
-            # SVO service - search for filter ID
             if not any([facility, instrument, filter_name]):
                 raise ValueError("Must provide at least one of: facility, instrument, or filter_name")
             
-            filter_id = cls._search_svo_filter(cls, facility, instrument, filter_name)
+            filter_id = cls._search_svo_filter(facility, instrument, filter_name)
             
-            # Use custom name if provided, otherwise use filter_name or filter_id
             if name:
                 final_name = name
             else:
                 final_name = filter_id
             
-            cls._load_from_svo(cls, filter_id, final_name)
+            cls._load_from_svo(filter_id, final_name)
         else:
-            # File path
-            cls._load_from_file(cls, str(source))
+            cls._load_from_file(str(source), name=name)
     
     @classmethod
     def add_custom(cls, name: str, wavelength: np.ndarray, response: np.ndarray, 
@@ -297,6 +339,47 @@ class Filters:
         
         cls._filters[name] = curve
         print(f"Added custom filter: {name}")
+
+    @classmethod
+    def _matching_filter_keys(cls, name: str,
+                              facility: Optional[str] = None,
+                              instrument: Optional[str] = None) -> list:
+        """Return filter keys matching a flexible name query."""
+        cls._load_predefined_filters()
+        name_lower = name.lower()
+        keys = list(cls._filters.keys())
+
+        exact = [key for key in keys if key.lower() == name_lower]
+        if exact:
+            return exact
+
+        candidates = []
+        if facility and instrument:
+            candidates.append(f"{facility}/{instrument}.{name}".lower())
+            candidates.append(f"{facility}.{instrument}.{name}".lower())
+        if facility:
+            candidates.append(f"{facility}.{name}".lower())
+        if instrument:
+            candidates.append(f"{instrument}.{name}".lower())
+
+        for candidate in candidates:
+            matches = [key for key in keys if key.lower() == candidate]
+            if matches:
+                return matches
+
+        matches = []
+        for key in keys:
+            key_lower = key.lower()
+            band = key_lower.split('/')[-1].split('.')[-1]
+            if band != name_lower:
+                continue
+            if facility and facility.lower() not in key_lower:
+                continue
+            if instrument and instrument.lower() not in key_lower:
+                continue
+            matches.append(key)
+
+        return matches
     
     @classmethod
     def get_filter_curve(cls, name: str = None, 
@@ -313,6 +396,13 @@ class Filters:
         """
         curve = cls.get_filter(name=name, facility=facility, instrument=instrument)
         return curve.wavelength, curve.response
+
+    @classmethod
+    def get_filter_properties(cls, name: str = None,
+                              facility: Optional[str] = None,
+                              instrument: Optional[str] = None) -> FilterProperties:
+        """Get calculated response-curve properties for a filter."""
+        return cls.get_filter(name=name, facility=facility, instrument=instrument).get_properties()
     
     @classmethod
     def get_filter(cls, name: str = None, 
@@ -327,43 +417,38 @@ class Filters:
         Returns:
             FilterCurve object
         """
-        if (facility is not None) and (instrument is not None):    
-            filterID = f"{facility}/{instrument}.{name}".lower()
-        elif facility is not None:
-            lower_keys = [key.lower() for key in set(cls._filters.keys())]
-            match_list = [key for key in lower_keys if (facility.lower() in key) and (name.lower() in key)]
-            filterID = match_list[0] if len(match_list) > 0 else name
-        elif instrument is not None:
-            lower_keys = [key.lower() for key in set(cls._filters.keys())]
-            match_list = [key for key in lower_keys if (instrument.lower() in key) and (name.lower() in key)]
-            filterID = match_list[0] if len(match_list) > 0 else name
-            
-            
-        if name in cls._filters:
-            curve = cls._filters[name]
-            return curve
-        
-        elif filterID in (key.lower() for key in cls._filters.keys()):
-            curve = cls._filters[next(key for key in cls._filters.keys() if key.lower() == filterID)]
-            return curve
-        else:
-            raise KeyError(f"Filter '{name}' not found. Available: {cls.list_filters(cls)}")
+        if name is None:
+            raise ValueError("Filter name must be provided")
+
+        matches = cls._matching_filter_keys(name, facility=facility, instrument=instrument)
+        if len(matches) == 1:
+            return cls._filters[matches[0]]
+        if len(matches) > 1:
+            raise KeyError(f"Filter '{name}' is ambiguous. Matches: {matches}")
+
+        raise KeyError(f"Filter '{name}' not found. Available: {cls.list_filters()}")
     
     @classmethod
     def get_all_filters(cls):
-        return [_filter.split("/")[-1].split(".")[-1] for _filter in cls.list_filters(cls)]
+        return [_filter.split("/")[-1].split(".")[-1] for _filter in cls.list_filters()]
     
-    def list_filters(self) -> list:
+    @classmethod
+    def list_filters(cls) -> list:
         """Return list of available filter names."""
-        return list(self._filters.keys())
+        cls._load_predefined_filters()
+        return list(cls._filters.keys())
     
     def __getitem__(self, name: str) -> FilterCurve:
         """Allow dictionary-style access to filters."""
-        return self.get_filter_curve(name)
+        return self.get_filter(name)
     
     def __contains__(self, name: str) -> bool:
         """Check if filter exists."""
-        return name in self._filters
+        try:
+            self.get_filter(name)
+            return True
+        except (KeyError, ValueError):
+            return False
     
     def __len__(self) -> int:
         """Return number of loaded filters."""

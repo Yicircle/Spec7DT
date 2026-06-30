@@ -18,6 +18,16 @@ from photutils.psf import extract_stars, EPSFBuilder, EPSFFitter, fit_2dgaussian
 
 warnings.simplefilter('ignore', category=AstropyWarning)
 
+# Try to import custom C convolution module
+try:
+    # This assumes the C code is compiled into a module named 'convolution'
+    # and is available in the python path, e.g., in a 'cpp' subpackage.
+    from ..cpp import convolution as cpp_conv
+    use_c_conv = True
+except (ImportError, ModuleNotFoundError):
+    use_c_conv = False
+
+
 from ..utils.utility import useful_functions
 from ..handlers.filter_handler import Filters
 from ..utils.file_handler import Parsers
@@ -111,19 +121,36 @@ class PointSpreadFunction:
         if not use_gpu:
             # Force kernel to float32
             kernel_arr = kernel.array.astype(np.float32)
-            
-            convolved_img = convolve_fft(
-                        image_data.astype(np.float32), kernel_arr,
-                        normalize_kernel=True,
-                        nan_treatment='interpolate',
-                        allow_huge=True
-            ).astype(np.float32)
-            convolved_err = convolve_fft(
-                error_data.astype(np.float32), kernel_arr,
-                normalize_kernel=True,
-                nan_treatment='interpolate',
-                allow_huge=True
-            ).astype(np.float32)
+
+            cpp_fallback = False
+            if use_c_conv:
+                try:
+                    # Use C implementation for convolution
+                    # Note: This implementation handles NaNs by normalization, similar to the GPU path,
+                    # which differs from astropy's 'interpolate' method.
+                    image_data_f32 = np.ascontiguousarray(image_data, dtype=np.float32)
+                    error_data_f32 = np.ascontiguousarray(error_data, dtype=np.float32)
+
+                    convolved_img = cpp_conv.convolve_fft_c(image_data_f32, kernel_arr)
+                    convolved_err = cpp_conv.convolve_fft_c(error_data_f32, kernel_arr)
+                except Exception as e:
+                    print(f"C convolution failed: {e}. Falling back to astropy.")
+                    cpp_fallback = True
+
+            if not use_c_conv or cpp_fallback:
+                # Fallback to astropy if C module not available or failed
+                convolved_img = convolve_fft(
+                            image_data.astype(np.float32), kernel_arr,
+                            normalize_kernel=True,
+                            nan_treatment='interpolate',
+                            allow_huge=True
+                ).astype(np.float32)
+                convolved_err = convolve_fft(
+                    error_data.astype(np.float32), kernel_arr,
+                    normalize_kernel=True,
+                    nan_treatment='interpolate',
+                    allow_huge=True
+                ).astype(np.float32)
 
         image_set.update_data(convolved_img, galaxy_name, observatory, band)
         image_set.update_error(convolved_err, galaxy_name, observatory, band)

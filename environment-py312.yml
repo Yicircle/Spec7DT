@@ -1,0 +1,24 @@
+name: spec7dt-py312
+channels:
+  - conda-forge
+  - nodefaults
+variables:
+  PYTHONNOUSERSITE: "1"
+  PYTHONPATH: ""
+dependencies:
+  - python=3.12.11
+  - pip
+  - setuptools
+  - wheel
+  - "numpy>=1.26,<2.7"
+  - "scipy>=1.12,<1.18"
+  - "astropy>=7.0,<8"
+  - "matplotlib>=3.8,<3.12"
+  - "photutils>=2.3,<3"
+  - "reproject>=0.20,<0.21"
+  - "pandas>=2.3,<3"
+  - "astroquery>=0.4.11,<0.5"
+  - "dustmaps>=1.0.14,<2"
+  - "astromatic-swarp>=2.38"
+  - pip:
+      - -e .

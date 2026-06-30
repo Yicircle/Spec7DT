@@ -46,6 +46,7 @@ class ImageProcessingPipeline:
                 # with open(f"Galaxy_Set_{step['name']}.pkl", 'wb') as file:
                 #     pickle.dump(self.galaxy_image_set, file)
                 
+                print(galaxy, observatory, band)
                 
                 if isinstance(plot_step, dict):
                     if "band" in plot_step.keys():
