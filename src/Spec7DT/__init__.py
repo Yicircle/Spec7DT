@@ -5,4 +5,4 @@ from .reduction import *
 from .plot import *
 from .core import AnalysisProduct, CatalogFrame, FitResultSet
 
-Version = "0.12.0"
+Version = "0.13.0"
