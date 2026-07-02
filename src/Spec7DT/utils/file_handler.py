@@ -42,6 +42,9 @@ class GalaxyImageSet:
         band = Parsers._band_name_parser(file_name=file_name, filter_inst=self.filter_inst)
         observatory = Parsers._observatory_name_parser(file_name=file_name)
         if galaxy_name is None or band is None or observatory is None:
+            warnings.warn(
+                f"Skipping {filepath}: could not parse galaxy, observatory, and band."
+            )
             return
 
         for attr in [self._data, self._header, self._error, self._psf, self._cutout_shape, self._files]:
@@ -306,6 +309,16 @@ class GalaxyImageSet:
                 galaxy = sorted(galaxy) if isinstance(galaxy, list) else [galaxy]
                 obs = sorted(obs) if isinstance(obs, list) else [obs]
                 print(f"Galaxy: {galaxy}\nObservatories: {obs} \nBands: {sorted(bands.keys())}")
+
+    def ensure_filters(self, allow_svo=True, cache=True, cache_dir=None, warn=True):
+        """Preload filter curves required by the images in this set."""
+        return self.filter_inst.ensure_filters_for_image_set(
+            self,
+            allow_svo=allow_svo,
+            cache=cache,
+            cache_dir=cache_dir,
+            warn=warn,
+        )
                 
     # ==== Plotting Properties ====
     def plot_image(self, value_tuple):
@@ -323,6 +336,14 @@ class GalaxyImageSet:
         
 
 class Parsers:
+    _KNOWN_BANDS_BY_OBSERVATORY = {
+        "GALEX": {"FUV", "NUV"},
+        "SDSS": {"u", "g", "r", "i", "z"},
+        "PACS": {"blue", "green", "red"},
+        "SPIRE": {"PSW", "PMW", "PLW"},
+        "WISE": {"W1", "W2", "W3", "W4", "w1", "w2", "w3", "w4"},
+    }
+
     def __init__(self):
         pass
     
@@ -349,15 +370,22 @@ class Parsers:
                 return match[0]
         return None
     
-    @staticmethod
-    def _band_name_parser(file_name, filter_inst):
+    @classmethod
+    def _band_name_parser(cls, file_name, filter_inst):
         """Parse band names from a given string or list."""
         if not isinstance(file_name, str):
             raise ValueError("file_name must be a string")
+
+        pattern = "|".join(map(re.escape, ['-', ' ', '_', '.']))
+        parts = re.split(pattern, file_name)
         
         for band in filter_inst.get_all_filters():
-            pattern = "|".join(map(re.escape, ['-', ' ', '_', '.']))
-            if band in re.split(pattern, file_name):
+            if band in parts:
+                return band
+
+        observatory = cls._observatory_name_parser(file_name)
+        for band in cls._KNOWN_BANDS_BY_OBSERVATORY.get(observatory, set()):
+            if band in parts:
                 return band
         return None
     

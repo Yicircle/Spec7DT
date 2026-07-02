@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Optional, Union, Dict, Tuple
 import numpy as np
 from importlib import resources
+import os
+import re
 import warnings
 
 from .filter_properties import (
@@ -19,6 +21,10 @@ def _get_svo_fps():
         from astroquery.svo_fps import SvoFps
     except ImportError as exc:
         raise ImportError("astroquery is required to load filters from SVO") from exc
+    try:
+        SvoFps.TIMEOUT = float(os.environ.get("SPEC7DT_SVO_TIMEOUT", "10"))
+    except Exception:
+        pass
     return SvoFps
 
 
@@ -104,6 +110,14 @@ class Filters:
     """Manages astronomical filter transmission curves from multiple sources."""
     _filters: Dict[str, FilterCurve] = {}
     _predefined_loaded: bool = False
+    _failed_remote_filters: set[tuple[str, str, str]] = set()
+    _SVO_SOURCE_ALIASES = {
+        "SPIRE": ("Herschel", "SPIRE"),
+        "PACS": ("Herschel", "PACS"),
+        "IRAC": ("Spitzer", "IRAC"),
+        "MIPS": ("Spitzer", "MIPS"),
+        "SDSS": ("SLOAN", "SDSS"),
+    }
     
     def __init__(self):
         """Initialize and load package-bundled filter curves."""
@@ -216,6 +230,222 @@ class Filters:
             
         except Exception as e:
             raise ValueError(f"Failed to load SVO filter '{filter_id}': {str(e)}")
+
+    @classmethod
+    def _resolved_cache_dir(cls, cache_dir: Union[str, Path, None] = None) -> Path:
+        if cache_dir is not None:
+            return Path(cache_dir).expanduser()
+        env_path = os.environ.get("SPEC7DT_FILTER_CACHE")
+        if env_path:
+            return Path(env_path).expanduser()
+        return Path("~/.cache/Spec7DT/filter_curves").expanduser()
+
+    @staticmethod
+    def _safe_cache_stem(name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_")
+
+    @classmethod
+    def _canonical_filter_name(cls, name: str,
+                               facility: Optional[str] = None,
+                               instrument: Optional[str] = None) -> str:
+        if facility and instrument and facility.lower() != instrument.lower():
+            return f"{facility}.{instrument}.{name}"
+        if facility:
+            return f"{facility}.{name}"
+        if instrument:
+            return f"{instrument}.{name}"
+        return name
+
+    @classmethod
+    def _cache_lookup_names(cls, name: str,
+                            facility: Optional[str] = None,
+                            instrument: Optional[str] = None) -> list[str]:
+        names = [
+            cls._canonical_filter_name(name, facility=facility, instrument=instrument),
+            cls._canonical_filter_name(name, facility=facility),
+            cls._canonical_filter_name(name, instrument=instrument),
+            name,
+        ]
+        seen = set()
+        unique = []
+        for candidate in names:
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
+    @classmethod
+    def _load_from_cache(cls, name: str,
+                         facility: Optional[str] = None,
+                         instrument: Optional[str] = None,
+                         cache_dir: Union[str, Path, None] = None) -> Optional[FilterCurve]:
+        cache_path = cls._resolved_cache_dir(cache_dir)
+        if not cache_path.exists():
+            return None
+
+        for lookup_name in cls._cache_lookup_names(name, facility=facility, instrument=instrument):
+            filepath = cache_path / f"{cls._safe_cache_stem(lookup_name)}.dat"
+            if not filepath.exists():
+                continue
+            cls._load_from_file(
+                filepath,
+                name=cls._canonical_filter_name(name, facility=facility, instrument=instrument),
+                source_type="cache",
+            )
+            return cls.get_filter(name=name, facility=facility, instrument=instrument)
+        return None
+
+    @classmethod
+    def _save_to_cache(cls, curve: FilterCurve,
+                       cache_dir: Union[str, Path, None] = None) -> None:
+        cache_path = cls._resolved_cache_dir(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        filepath = cache_path / f"{cls._safe_cache_stem(curve.name)}.dat"
+        curve.save_to_file(filepath)
+
+    @classmethod
+    def _svo_search_attempts(cls, name: str,
+                             facility: Optional[str] = None,
+                             instrument: Optional[str] = None) -> list[tuple[Optional[str], Optional[str], str]]:
+        attempts = []
+
+        def add(source_facility, source_instrument):
+            candidate = (source_facility, source_instrument, name)
+            key = tuple("" if item is None else str(item).lower() for item in candidate)
+            if key not in seen:
+                seen.add(key)
+                attempts.append(candidate)
+
+        seen = set()
+        add(facility, instrument)
+
+        for source in (facility, instrument):
+            if source is None:
+                continue
+            alias = cls._SVO_SOURCE_ALIASES.get(str(source).upper())
+            if alias is not None:
+                add(alias[0], alias[1])
+
+        if facility and instrument is None:
+            add(None, facility)
+        if instrument and facility is None:
+            add(instrument, None)
+
+        return attempts
+
+    @classmethod
+    def ensure_filter(cls, name: str,
+                      facility: Optional[str] = None,
+                      instrument: Optional[str] = None,
+                      allow_svo: bool = True,
+                      cache: bool = True,
+                      cache_dir: Union[str, Path, None] = None,
+                      warn: bool = True) -> FilterCurve:
+        """
+        Ensure a filter curve is available from registry/local references, cache, or SVO.
+        """
+        try:
+            return cls.get_filter(name=name, facility=facility, instrument=instrument)
+        except (KeyError, ValueError):
+            pass
+
+        if cache:
+            try:
+                cached = cls._load_from_cache(
+                    name=name,
+                    facility=facility,
+                    instrument=instrument,
+                    cache_dir=cache_dir,
+                )
+                if cached is not None:
+                    return cached
+            except Exception as exc:
+                if warn:
+                    warnings.warn(f"Failed to load cached filter '{facility}.{name}': {exc}")
+
+        if not allow_svo:
+            raise KeyError(f"Filter '{name}' not found in local references or cache.")
+
+        failure_key = (
+            "" if facility is None else str(facility).lower(),
+            "" if instrument is None else str(instrument).lower(),
+            str(name).lower(),
+        )
+        if failure_key in cls._failed_remote_filters:
+            raise KeyError(f"Previous SVO lookup failed for filter '{facility}.{name}'.")
+
+        errors = []
+        canonical_name = cls._canonical_filter_name(name, facility=facility, instrument=instrument)
+        for source_facility, source_instrument, source_name in cls._svo_search_attempts(
+            name,
+            facility=facility,
+            instrument=instrument,
+        ):
+            try:
+                filter_id = cls._search_svo_filter(
+                    facility=source_facility,
+                    instrument=source_instrument,
+                    filter_name=source_name,
+                )
+                cls._load_from_svo(filter_id, canonical_name)
+                curve = cls.get_filter(name=name, facility=facility, instrument=instrument)
+                if cache:
+                    try:
+                        cls._save_to_cache(curve, cache_dir=cache_dir)
+                    except Exception as exc:
+                        if warn:
+                            warnings.warn(f"Failed to cache filter '{curve.name}': {exc}")
+                return curve
+            except Exception as exc:
+                source = ".".join(str(item) for item in (source_facility, source_instrument, source_name) if item)
+                errors.append(f"{source}: {exc}")
+
+        cls._failed_remote_filters.add(failure_key)
+        raise KeyError(
+            f"Filter '{name}' not found locally/cache and SVO lookup failed. "
+            f"Attempts: {'; '.join(errors)}"
+        )
+
+    @classmethod
+    def ensure_filters_for_image_set(cls, image_set,
+                                     allow_svo: bool = True,
+                                     cache: bool = True,
+                                     cache_dir: Union[str, Path, None] = None,
+                                     warn: bool = True) -> dict[str, list[str]]:
+        """
+        Preload all filter curves referenced by a GalaxyImageSet-like data tree.
+        """
+        loaded = []
+        missing = []
+        seen = set()
+
+        for galaxy_data in getattr(image_set, "data", {}).values():
+            for observatory, bands in galaxy_data.items():
+                for band in bands:
+                    key = (str(observatory), str(band))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    try:
+                        curve = cls.ensure_filter(
+                            name=band,
+                            facility=observatory,
+                            allow_svo=allow_svo,
+                            cache=cache,
+                            cache_dir=cache_dir,
+                            warn=warn,
+                        )
+                        loaded.append(curve.name)
+                    except Exception as exc:
+                        label = f"{observatory}.{band}"
+                        missing.append(label)
+                        if warn:
+                            warnings.warn(f"Filter curve unavailable for {label}: {exc}")
+
+        return {"loaded": loaded, "missing": missing}
     
     @classmethod
     def _search_svo_filter(cls, facility: Optional[str] = None,

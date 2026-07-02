@@ -1,25 +1,48 @@
 import numpy as np
-from astropy.coordinates import SkyCoord
-from astroquery.ipac.ned import Ned
-from dustmaps.planck import PlanckQuery
+import warnings
 
 from ..handlers.filter_handler import Filters
+from ..utils.utility import useful_functions
 
 class Reddening:
     def __init__(self):
-        from dustmaps.config import config
-        config.reset()
+        try:
+            from dustmaps.config import config
+            config.reset()
+        except Exception:
+            pass
         self.filter_inst = Filters()
     
-    def dered(self, image_data, error_data, galaxy_name, observatory, band, image_set):
+    def dered(self, image_data, header, error_data, galaxy_name, observatory, band, image_set,
+              metadata_resolver=None, filter_config=None):
         self.obj, self.obs, self.filt = galaxy_name, observatory, band
-        self.ra, self.dec = Ned.query_object(self.obj)['RA', 'DEC'][0]
-        coords = SkyCoord(self.ra, self.dec, unit='deg', frame='icrs')
+        self.filter_config = filter_config or {}
+        coords = useful_functions.get_sky_loc(
+            self.obj,
+            header=header,
+            metadata_resolver=metadata_resolver,
+            required=False,
+        )
+        if coords is None:
+            warnings.warn(f"Skipping dereddening for {self.obj}: galaxy coordinate unavailable.")
+            return
+
+        try:
+            from dustmaps.planck import PlanckQuery
+
+            planck = PlanckQuery()
+            self.ebv = planck(coords)
+        except Exception as exc:
+            warnings.warn(f"Skipping dereddening for {self.obj}: dust map query failed ({exc}).")
+            return
         
-        planck = PlanckQuery()
-        self.ebv = planck(coords)
-        
-        wave, resp = self.get_resp_curve()
+        try:
+            wave, resp = self.get_resp_curve()
+        except Exception as exc:
+            warnings.warn(
+                f"Skipping dereddening for {self.obj}: filter curve unavailable ({exc})."
+            )
+            return
         
         # Check if filter is valid for CCM98 model
         if (max(wave) > 3.3 * 1e4) | (min(wave) < 9.1 * 1e2):
@@ -39,7 +62,11 @@ class Reddening:
         
         try:
             # Try to get filter curve using observatory and band
-            curve = self.filter_inst.get_filter(name=self.filt, facility=self.obs)
+            curve = self.filter_inst.ensure_filter(
+                name=self.filt,
+                facility=self.obs,
+                **getattr(self, "filter_config", {}),
+            )
             
             # Filter out zero response values
             mask = (curve.response != 0)
@@ -53,10 +80,8 @@ class Reddening:
             
             return wave, resp
             
-        except Exception as e:
-            print(f"Error loading filter '{self.obs}.{self.filt}': {e}")
-            print("Make sure the filter exists in the Filters class")
-            raise UserWarning("Filter Existance Warning")
+        except Exception:
+            raise
     
     def reddening_ccm(self, wave, ebv=None, a_v=None, r_v=3.1, model='ccm89'):
         """

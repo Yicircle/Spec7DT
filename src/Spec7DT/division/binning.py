@@ -1,8 +1,5 @@
-from reproject.mosaicking import find_optimal_celestial_wcs
-from astropy import units as u
 from astropy.wcs import WCS
 from ..utils.utility import useful_functions
-from astropy.nddata import NDData
 
 class Bin:
     def __init__(self):
@@ -11,13 +8,22 @@ class Bin:
     @classmethod
     def do_binning(cls, bin_size, image_data, error_data, galaxy_name, observatory, band, image_set):
         im_header = image_set.header[galaxy_name][observatory][band]
-        pix_scale_ori = useful_functions.get_pixel_scale(im_header)
-        
-        total_size = int(image_data.shape[0] // bin_size)
-        binned_img = cls.binning(image_data, total_size, total_size)
-        binned_err = cls.binning_err(error_data, total_size, total_size)
-        wcs_header = WCS(im_header)
-        wcs_out, _ = find_optimal_celestial_wcs(NDData(image_data, wcs=WCS(im_header)), resolution=pix_scale_ori * bin_size * u.arcsec)
+        if bin_size < 1:
+            raise ValueError("bin_size must be >= 1")
+
+        binned_y = int(image_data.shape[0] // bin_size)
+        binned_x = int(image_data.shape[1] // bin_size)
+        if binned_y < 1 or binned_x < 1:
+            raise ValueError("bin_size is larger than the image dimensions")
+
+        crop_y = binned_y * bin_size
+        crop_x = binned_x * bin_size
+        image_data = image_data[:crop_y, :crop_x]
+        error_data = error_data[:crop_y, :crop_x]
+
+        binned_img = cls.binning(image_data, binned_y, binned_x)
+        binned_err = cls.binning_err(error_data, binned_y, binned_x)
+        wcs_out = cls.binned_wcs(WCS(im_header), bin_size)
         
         header_clean = im_header.copy()
         wcs_keys = ['CD1_1', 'CD1_2', 'CD2_1', 'CD2_2', 'PC1_1', 'PC1_2', 'PC2_1', 'PC2_2',
@@ -33,10 +39,27 @@ class Bin:
                 del header_clean[key]
         
         updated_header = useful_functions.update_header(header_clean, wcs_out.to_header())
+        updated_header["NAXIS1"] = binned_x
+        updated_header["NAXIS2"] = binned_y
         
         image_set.update_data(binned_img, galaxy_name, observatory, band)
         image_set.update_error(binned_err, galaxy_name, observatory, band)
         image_set.update_header(updated_header, galaxy_name, observatory, band)
+
+    @staticmethod
+    def binned_wcs(wcs, bin_size):
+        wcs_out = wcs.deepcopy()
+        wcs_out.wcs.crpix = (wcs_out.wcs.crpix - 0.5) / bin_size + 0.5
+
+        try:
+            if wcs_out.wcs.has_cd():
+                wcs_out.wcs.cd = wcs_out.wcs.cd * bin_size
+            else:
+                wcs_out.wcs.cdelt = wcs_out.wcs.cdelt * bin_size
+        except AttributeError:
+            wcs_out.wcs.cdelt = wcs_out.wcs.cdelt * bin_size
+
+        return wcs_out
         
     def binning(image, bin_x, bin_y):
         return image.reshape(bin_x, image.shape[0] // bin_x, bin_y, image.shape[1] // bin_y).sum(3).sum(1)

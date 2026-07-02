@@ -34,7 +34,7 @@ class Register:
         
     
     @classmethod
-    def swarp_register(cls, image_data, header, error_data, galaxy_name, observatory, band, image_set):
+    def swarp_register(cls, image_data, header, error_data, galaxy_name, observatory, band, image_set, metadata_resolver=None):
         file_list = list(useful_functions.extract_values_recursive(image_set._files, galaxy_name))
         
         repre_path = Path(file_list[0]).parent
@@ -58,7 +58,12 @@ class Register:
                         
             file_list_name = str(list_file_path)
             
-            center_coord = useful_functions.get_sky_loc(galaxy_name)
+            center_coord = useful_functions.get_sky_loc(
+                galaxy_name,
+                header=header,
+                metadata_resolver=metadata_resolver,
+                required=True,
+            )
             
             cls.swarp(cls, input_list=file_list_name, output=output_path,
                     center=f"{center_coord.ra.value},{center_coord.dec.value}",
@@ -104,8 +109,13 @@ class Register:
             
             
     @classmethod
-    def trim(cls, image_data, header, error_data, galaxy_name, observatory, band, image_set, trim_size):
-        center_coord = useful_functions.get_sky_loc(galaxy_name)
+    def trim(cls, image_data, header, error_data, galaxy_name, observatory, band, image_set, trim_size, metadata_resolver=None):
+        center_coord = useful_functions.get_sky_loc(
+            galaxy_name,
+            header=header,
+            metadata_resolver=metadata_resolver,
+            required=True,
+        )
         
         trim_image, trim_header, trim_error = cls.trim_sky(cls, image=image_data, header=header, error=error_data, skycoord=center_coord, size=trim_size)
         

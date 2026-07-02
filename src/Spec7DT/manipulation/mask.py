@@ -1,6 +1,5 @@
 import math
 import numpy as np
-from astroquery.ipac.ned import Ned
 from astropy.wcs import WCS
 from photutils.segmentation import detect_sources
 from photutils.background import Background2D, MedianBackground, LocalBackground, MMMBackground
@@ -16,7 +15,7 @@ class Masking:
         pass
     
     @classmethod
-    def adapt_mask(cls, image_data, header, error_data, galaxy_name, observatory, band, image_set, manual):
+    def adapt_mask(cls, image_data, header, error_data, galaxy_name, observatory, band, image_set, manual, metadata_resolver=None):
         if ("max" not in image_set.psf[galaxy_name]) or (image_set.psf[galaxy_name]["max"] == -1):
             psf_list = useful_functions.extract_values_recursive(image_set.psf, galaxy_name)
             sig_t = np.max(psf_list)
@@ -30,15 +29,30 @@ class Masking:
         pixel_scale = useful_functions.get_pixel_scale(header)
         fwhm = fwhm / pixel_scale  # in pixel
         
-        mask_image, masked_image, _ = cls.make_mask(cls, image_data, header, galaxy_name, fwhm, manual)
+        mask_image, masked_image, _ = cls.make_mask(
+            cls,
+            image_data,
+            header,
+            galaxy_name,
+            fwhm,
+            manual,
+            metadata_resolver=metadata_resolver,
+        )
         masked_err = np.where(mask_image, 999.0, error_data)
         
         image_set.update_data(masked_image, galaxy_name, observatory, band)
         image_set.update_error(masked_err, galaxy_name, observatory, band)
     
     
-    def make_mask(self, image, header, galaxy, psf_fwhm, manual):
-        mask, masked, sky = self.py2dmask(self, image, header, galaxy, psf_fwhm)
+    def make_mask(self, image, header, galaxy, psf_fwhm, manual, metadata_resolver=None):
+        mask, masked, sky = self.py2dmask(
+            self,
+            image,
+            header,
+            galaxy,
+            psf_fwhm,
+            metadata_resolver=metadata_resolver,
+        )
         
         if manual is not None:
             star_mask = self.manual_mask(self, image, header, psf_fwhm, manual)
@@ -73,11 +87,16 @@ class Masking:
         return mask
     
     
-    def py2dmask(self, image, header, galaxy, psf_fwhm):
-        ra, dec = Ned.query_object(galaxy)['RA', 'DEC'][0]
+    def py2dmask(self, image, header, galaxy, psf_fwhm, metadata_resolver=None):
+        center_coord = useful_functions.get_sky_loc(
+            galaxy,
+            header=header,
+            metadata_resolver=metadata_resolver,
+            required=True,
+        )
         
         wcs = WCS(header)
-        x, y = wcs.all_world2pix(ra, dec, 0)
+        x, y = wcs.all_world2pix(center_coord.ra.deg, center_coord.dec.deg, 0)
         
         from astropy.stats import sigma_clipped_stats
         mean, median, std = sigma_clipped_stats(image, sigma=10.0, mask=np.where(image == 0, True, False))
@@ -145,15 +164,20 @@ class Masking:
         return mask_image, masked_image, np.full_like(masked_image, fill_value=median)
 
 
-    def __make_mask(self, image, header, galaxy, psf_fwhm):
+    def __make_mask(self, image, header, galaxy, psf_fwhm, metadata_resolver=None):
         psf_fwhm = np.abs(psf_fwhm)
-        ra, dec = Ned.query_object(galaxy)['RA', 'DEC'][0]
+        center_coord = useful_functions.get_sky_loc(
+            galaxy,
+            header=header,
+            metadata_resolver=metadata_resolver,
+            required=True,
+        )
         image_x, image_y = image.shape
         box_shape = [int(image_x/5), int(image_y/5)]
         filter_shape = [int(psf_fwhm*2.0) * 2 + 1, int(psf_fwhm*2.0) * 2 + 1]
         
         wcs = WCS(header)
-        x, y = wcs.all_world2pix(ra, dec, 0)
+        x, y = wcs.all_world2pix(center_coord.ra.deg, center_coord.dec.deg, 0)
 
         bkg_estimator = MedianBackground()
         try:    

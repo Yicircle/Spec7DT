@@ -7,10 +7,14 @@ from datetime import datetime
 import pickle
 
 from ..plot.plot import DrawGalaxy
+from ..handlers.filter_handler import Filters
+from .metadata import GalaxyMetadataConfig, GalaxyMetadataResolver
 
 class ImageProcessingPipeline:
-    def __init__(self, galaxy_image_set):
+    def __init__(self, galaxy_image_set, metadata_resolver=None, filter_config=None):
         self.galaxy_image_set = galaxy_image_set
+        self.metadata_resolver = metadata_resolver or GalaxyMetadataResolver()
+        self.filter_config = filter_config or {}
         self.pipeline_steps = []
         self.step_configs = {}
         self.starttime = datetime.now()
@@ -36,17 +40,29 @@ class ImageProcessingPipeline:
         # 필터 조건에 맞는 이미지들을 선택
         
         for step in self.pipeline_steps:
+            processed_targets = 0
+            last_target = None
+
             # Use generator to process images one by one without holding all in memory
             for galaxy, observatory, band, image, header, error in self._get_filtered_targets(galaxy_filter, observatory_filter, band_filter):
+                processed_targets += 1
+                last_target = (galaxy, observatory, band)
                 self._execute_step(step, galaxy, observatory, band, image, header, error, verbose)
-                
-            if plot_step is not None:
+
+            if processed_targets == 0:
+                raise ValueError(
+                    f"No images available for pipeline step '{step['name']}'. "
+                    "Check the GalaxyImageSet contents and filename parsing."
+                )
+
+            if plot_step:
                 print(f"Time lack: {datetime.now() - self.starttime}")
                 self.starttime = datetime.now()
                 
                 # with open(f"Galaxy_Set_{step['name']}.pkl", 'wb') as file:
                 #     pickle.dump(self.galaxy_image_set, file)
                 
+                galaxy, observatory, band = last_target
                 print(galaxy, observatory, band)
                 
                 if isinstance(plot_step, dict):
@@ -56,7 +72,11 @@ class ImageProcessingPipeline:
                                                 plot_step.get("obs", observatory),
                                                 plot_step.get("band", band))
                     else:
-                        DrawGalaxy.plot_galaxies(self.galaxy_image_set, galaxy, step["name"])
+                        DrawGalaxy.plot_galaxies(
+                            self.galaxy_image_set,
+                            plot_step.get("galaxy", galaxy),
+                            step["name"],
+                        )
                         plt.show()
                 
         return self.galaxy_image_set
@@ -94,7 +114,9 @@ class ImageProcessingPipeline:
         # image_data, header, error_data, galaxy_name, observatory, band, image_set
         kwargs = {'image_set': self.galaxy_image_set,
                   'image_data':image, 'header':header, 'error_data':error,
-                  'galaxy_name': galaxy, 'observatory': observatory, 'band': band}
+                  'galaxy_name': galaxy, 'observatory': observatory, 'band': band,
+                  'metadata_resolver': self.metadata_resolver,
+                  'filter_config': self.filter_config}
         
         kwargs.update(config)
         
@@ -168,11 +190,28 @@ def execute_pipeline(
     box_size=None,
     cut_coeff=1.5,
     config: PipelineConfig = None,
+    galaxy_metadata: dict = None,
+    metadata_config: GalaxyMetadataConfig | dict = None,
+    filter_config: dict = None,
 ):
     pipeline_config = PipelineConfig.from_processes(config if config is not None else processes)
+    if isinstance(metadata_config, dict):
+        metadata_config = GalaxyMetadataConfig(**metadata_config)
+    metadata_resolver = GalaxyMetadataResolver(metadata=galaxy_metadata, config=metadata_config)
+
+    filter_options = {"allow_svo": True, "cache": True, "warn": True}
+    if filter_config:
+        filter_options.update(filter_config)
+
+    if pipeline_config.enabled("dered") or pipeline_config.enabled("psf"):
+        Filters.ensure_filters_for_image_set(galaxy_image_set, **filter_options)
     
     
-    pipeline1 = ImageProcessingPipeline(galaxy_image_set)
+    pipeline1 = ImageProcessingPipeline(
+        galaxy_image_set,
+        metadata_resolver=metadata_resolver,
+        filter_config=filter_options,
+    )
 
     pipeline_config.enabled("background") and pipeline1.add_step(backgroundSubtraction)
     pipeline_config.enabled("psf") and pipeline1.add_step(PointSpreadFunction.extract, step_name="Extract PSF")
@@ -194,5 +233,9 @@ def execute_pipeline(
     
     galaxy_image_set = pipeline1.execute(plot_step=plot_step, verbose=verbose)
     
-    input_df = inputGenerator.dataframe_generator(galaxy_image_set, cat_type)
+    input_df = inputGenerator.dataframe_generator(
+        galaxy_image_set,
+        cat_type,
+        metadata_resolver=metadata_resolver,
+    )
     return input_df

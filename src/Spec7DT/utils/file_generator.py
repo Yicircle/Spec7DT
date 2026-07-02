@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 
 from .utility import useful_functions
+from .metadata import GalaxyMetadataResolver
 from ..handlers.catalog_adapters import get_catalog_columns
 
 class inputGenerator:
@@ -9,7 +10,8 @@ class inputGenerator:
         pass
     
     @classmethod
-    def dataframe_generator(cls, image_set, cat_type):
+    def dataframe_generator(cls, image_set, cat_type, metadata_resolver=None):
+        metadata_resolver = metadata_resolver or GalaxyMetadataResolver()
         data_dict = {}
         generated_ids = False
         
@@ -60,7 +62,7 @@ class inputGenerator:
         df['redshift'] = np.nan
         galaxies = list(image_set.data.keys())
         for g in galaxies:
-            z = useful_functions.get_redshift(g)
+            z = metadata_resolver.get_redshift(g)
             if z is not None:
                 # Use startswith for faster matching than contains
                 mask = df['id'].str.startswith(f"{g}_")

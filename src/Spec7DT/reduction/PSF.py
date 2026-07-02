@@ -39,8 +39,8 @@ class PointSpreadFunction:
         pass
     
     @classmethod
-    def extract(cls, image_data, header, galaxy_name, observatory, band, image_set):
-        fwhm_val = cls.get_epsf(image_data, header, galaxy_name, observatory, band)
+    def extract(cls, image_data, header, galaxy_name, observatory, band, image_set, metadata_resolver=None):
+        fwhm_val = cls.get_epsf(image_data, header, galaxy_name, observatory, band, metadata_resolver=metadata_resolver)
         
         if fwhm_val is None:
             fwhm_val = cls.measure_psf_fwhm(cls, image_data, header, threshold_sigma=15)
@@ -160,13 +160,19 @@ class PointSpreadFunction:
     
     
     @classmethod
-    def detect_star(cls, image, header, threshold_sigma, galaxy, observatory, band):
-        curve = cls.filt_inst.get_filter(name=band, facility=observatory)
-        mask = (curve.response != 0)
-        wave = curve.wavelength[mask]
-        min_wave = np.nanmin(wave)
+    def detect_star(cls, image, header, threshold_sigma, galaxy, observatory, band, metadata_resolver=None):
+        try:
+            curve = cls.filt_inst.ensure_filter(name=band, facility=observatory)
+            mask = (curve.response != 0)
+            wave = curve.wavelength[mask]
+            min_wave = np.nanmin(wave)
+        except (KeyError, ValueError):
+            stars = cls.get_predefined_model(observatory, band)
+            if stars is not None:
+                return stars
+            min_wave = np.nan
         
-        if (threshold_sigma < 10) or (min_wave > 12 * 1e4):
+        if (threshold_sigma < 10) or (np.isfinite(min_wave) and min_wave > 12 * 1e4):
             stars = cls.get_predefined_model(observatory, band)
             return stars
         
@@ -186,7 +192,12 @@ class PointSpreadFunction:
 
         size = int(50 / useful_functions.get_pixel_scale(header)) // 2 * 2 + 1
         hsize = (size - 1) / 2
-        gal_coord = useful_functions.get_sky_loc(galaxy)
+        gal_coord = useful_functions.get_sky_loc(
+            galaxy,
+            header=header,
+            metadata_resolver=metadata_resolver,
+            required=True,
+        )
         x_gal, y_gal = WCS(header).world_to_pixel(gal_coord)
 
         x, y = sources['xcentroid'], sources['ycentroid']
@@ -205,16 +216,25 @@ class PointSpreadFunction:
         if len(stars) > 20:
             return stars
         else:
-            return cls.detect_star(image, header, threshold_sigma * 0.8, galaxy, observatory, band)
+            return cls.detect_star(
+                image,
+                header,
+                threshold_sigma * 0.8,
+                galaxy,
+                observatory,
+                band,
+                metadata_resolver=metadata_resolver,
+            )
 
 
     @classmethod
-    def get_epsf(cls, image=None, header=None, galaxy=None, observatory=None, band=None):
+    def get_epsf(cls, image=None, header=None, galaxy=None, observatory=None, band=None, metadata_resolver=None):
         
         image = np.nan_to_num(image, nan=0.0)
 
         stars = cls.detect_star(image=image, header=header, threshold_sigma=200, 
-                                galaxy=galaxy, observatory=observatory, band=band)
+                                galaxy=galaxy, observatory=observatory, band=band,
+                                metadata_resolver=metadata_resolver)
         
         psf = None
         if not isinstance(stars, str):

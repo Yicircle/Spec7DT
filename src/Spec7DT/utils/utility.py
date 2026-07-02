@@ -40,7 +40,7 @@ class useful_functions:
     @classmethod
     def get_redshift(cls, galaxy_name):
         """
-        Query redshift from NED using galaxy name.
+        Resolve redshift using the shared metadata resolver.
         
         Parameters:
         -----------
@@ -52,29 +52,9 @@ class useful_functions:
         float or None
             Redshift value, or None if not found
         """
-        from astroquery.ned import Ned
-        
-        try:
-            # Query basic information from NED
-            result_table = Ned.query_object(galaxy_name)
-            
-            if len(result_table) > 0:
-                # Get the redshift value
-                redshift = result_table['Redshift'][0]
-                
-                # Check if redshift is valid (not masked or NaN)
-                if not np.ma.is_masked(redshift) and not np.isnan(redshift):
-                    return float(redshift)
-                else:
-                    print(f"No redshift data available for {galaxy_name}")
-                    return None
-            else:
-                print(f"Galaxy {galaxy_name} not found in NED")
-                return None
-                
-        except Exception as e:
-            print(f"Error querying {galaxy_name}: {str(e)}")
-            return None
+        from .metadata import GalaxyMetadataResolver
+
+        return GalaxyMetadataResolver().get_redshift(galaxy_name)
     
     @classmethod
     def get_galaxy_radius(cls, image):
@@ -97,15 +77,17 @@ class useful_functions:
         return x0, y0, a, b, theta
     
     @staticmethod
-    def get_sky_loc(location):
+    def get_sky_loc(location, header=None, metadata_resolver=None, required=True):
         from astropy.coordinates import SkyCoord
-        from astroquery.ipac.ned import Ned
-        
-        if isinstance(location, str):
-            ra, dec = Ned.query_object(location)['RA', 'DEC'][0]
-            
-        sky_loc = SkyCoord(ra=ra, dec=dec, unit="deg")
-        return sky_loc
+        from .metadata import GalaxyMetadataResolver
+
+        if isinstance(location, SkyCoord):
+            return location
+        if isinstance(location, (tuple, list, np.ndarray)) and len(location) >= 2:
+            return SkyCoord(ra=float(location[0]) * u.deg, dec=float(location[1]) * u.deg, frame="icrs")
+
+        resolver = metadata_resolver or GalaxyMetadataResolver()
+        return resolver.get_skycoord(location, header=header, required=required)
     
     @staticmethod
     def find_rec(N):
