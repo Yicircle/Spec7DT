@@ -3,10 +3,17 @@ import math
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from photutils.segmentation import detect_threshold, detect_sources, SourceCatalog
+from .reporting import emit_alert
 
 
 class Observatories:
     """Class to handle different observatories and their properties."""
+    _NAME_ALIASES = {
+        "ukirt": "UKIRT",
+        "wfcam": "UKIRT",
+        "ukidss": "UKIRT",
+    }
+
     def __init__(self):
         self.optical_obs = self._opticals()
         self.ir_obs = self._infrareds()
@@ -20,7 +27,7 @@ class Observatories:
     
     def _infrareds(self):
         """Return a list of infrared observatories."""
-        return ['WISE', 'Spitzer', 'IRAC', 'MIPS', 'Herschel', 'JWST', 'VISTA', 'UKIDSS', '2MASS', 'SPHEREx', 'PACS', 'SPIRE']
+        return ['WISE', 'Spitzer', 'IRAC', 'MIPS', 'Herschel', 'JWST', 'VISTA', 'UKIRT', '2MASS', 'SPHEREx', 'PACS', 'SPIRE']
     
     def _ultraviolet(self):
         """Return a list of ultraviolet observatories."""
@@ -34,6 +41,25 @@ class Observatories:
     def get_observatories(cls):
         """Return a list of all observatories."""
         return cls().observatories
+
+    @classmethod
+    def normalize_name(cls, value):
+        """Return the canonical observatory name for a known name or alias."""
+        if value is None:
+            return None
+
+        name = str(value).strip()
+        if not name:
+            return name
+
+        alias = cls._NAME_ALIASES.get(name.lower())
+        if alias is not None:
+            return alias
+
+        for observatory in cls.get_observatories():
+            if name.lower() == observatory.lower():
+                return observatory
+        return name
     
 
 class useful_functions:
@@ -57,12 +83,16 @@ class useful_functions:
         return GalaxyMetadataResolver().get_redshift(galaxy_name)
     
     @classmethod
-    def get_galaxy_radius(cls, image):
+    def get_galaxy_radius(cls, image, context=None):
         threshold = detect_threshold(image, nsigma=3.0)
 
         segm = detect_sources(image, threshold, npixels=5)
         if segm is None:
-            print("No sources detected.")
+            emit_alert(
+                "No sources were detected; using the full image as galaxy geometry.",
+                context=context,
+                dedupe_key="galaxy_geometry.no_sources",
+            )
             a, b = image.shape
             x0, y0 = image.shape[0]/2, image.shape[1]/2
             theta = 0
@@ -77,7 +107,7 @@ class useful_functions:
         return x0, y0, a, b, theta
     
     @staticmethod
-    def get_sky_loc(location, header=None, metadata_resolver=None, required=True):
+    def get_sky_loc(location, header=None, metadata_resolver=None, required=True, image_shape=None):
         from astropy.coordinates import SkyCoord
         from .metadata import GalaxyMetadataResolver
 
@@ -87,7 +117,12 @@ class useful_functions:
             return SkyCoord(ra=float(location[0]) * u.deg, dec=float(location[1]) * u.deg, frame="icrs")
 
         resolver = metadata_resolver or GalaxyMetadataResolver()
-        return resolver.get_skycoord(location, header=header, required=required)
+        return resolver.get_skycoord(
+            location,
+            header=header,
+            required=required,
+            image_shape=image_shape,
+        )
     
     @staticmethod
     def find_rec(N):
@@ -358,7 +393,7 @@ class useful_functions:
                     shrinkA=0,
                     shrinkB=0))
         ax.text(x + dx_n*1.2, y + dy_n*1.2, 'N', color=color, 
-                fontsize=7, fontweight='bold', ha='center', va='center')
+                fontsize=9, fontweight='bold', ha='center', va='center')
         
         # Plot East arrow
         ax.annotate('',xy=(x + dx_e, y + dy_e), xytext=(x, y),
@@ -370,7 +405,7 @@ class useful_functions:
                     shrinkA=0,
                     shrinkB=0))
         ax.text(x + dx_e*1.2, y + dy_e*1.2, 'E', color=color,
-                fontsize=7, fontweight='bold', ha='center', va='center')
+                fontsize=9, fontweight='bold', ha='center', va='center')
         
     @classmethod
     def plot_scale(cls, ax, x, y, wcs, size=30, color='cyan'):
@@ -412,7 +447,7 @@ class useful_functions:
                     shrinkA=0,
                     shrinkB=0))
         ax.text(x, y + size_pix * 0.3, scale_text, color=color,
-                fontsize=7, fontweight='bold', ha='center', va='center')
+                fontsize=9, fontweight='bold', ha='center', va='center')
         
         
     @classmethod

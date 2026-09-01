@@ -3,6 +3,7 @@ import warnings
 
 from ..handlers.filter_handler import Filters
 from ..utils.utility import useful_functions
+from ..utils.reporting import emit_alert, emit_detail
 
 class Reddening:
     def __init__(self):
@@ -46,7 +47,12 @@ class Reddening:
         
         # Check if filter is valid for CCM98 model
         if (max(wave) > 3.3 * 1e4) | (min(wave) < 9.1 * 1e2):
-            print('Filter is not valid for CCM98 model')
+            emit_alert(
+                "Skipping dereddening because the filter response lies outside "
+                f"the CCM98 range ({min(wave):.1f}–{max(wave):.1f} Angstrom).",
+                context=f"{galaxy_name}/{observatory}/{band}",
+                dedupe_key="reddening.ccm98_range",
+            )
             return 0
         
         A_mean = self._calculate_mean_extinction(wave, resp)
@@ -74,9 +80,9 @@ class Reddening:
             resp = curve.response[mask]
             
             if verbose:
-                print(f"Loaded filter: {curve.name} ({curve.unit_type})")
+                emit_detail(f"Loaded filter: {curve.name} ({curve.unit_type})")
                 if curve.description:
-                    print(f"Description: {curve.description}")
+                    emit_detail(f"Description: {curve.description}")
             
             return wave, resp
             

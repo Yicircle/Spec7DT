@@ -19,6 +19,7 @@ dependencies:
   - "pandas>=2.3,<3"
   - "astroquery>=0.4.11,<0.5"
   - "dustmaps>=1.0.14,<2"
+  - "rich>=13.7,<16"
   - "astromatic-swarp>=2.38"
   - pip:
       - -e .

@@ -7,6 +7,7 @@ __pycache__/
 
 # Test directories and files
 *test/*
+!test/test_registration.py
 */*/temp/*
 
 # Distribution / packaging

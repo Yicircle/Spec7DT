@@ -1,3 +1,1 @@
-recursive-include src/Spec7DT/reference/filter_curves *.dat
-recursive-include src/Spec7DT/reference/psfs *.fits
 recursive-include src/Spec7DT/reference/configs *.swarp

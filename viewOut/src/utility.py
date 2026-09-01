@@ -156,10 +156,12 @@ class Parsers:
         """Parse observatory names from a given string or list."""
         if not isinstance(file_name, str):
             raise ValueError("file_name must be a string")
-        for obs in Observatories.get_observatories():
-            pattern = "|".join(map(re.escape, ['-', ' ', '_', '.', '/']))
-            if obs in re.split(pattern, file_name):
-                return obs
+        pattern = "|".join(map(re.escape, ['-', ' ', '_', '.', '/']))
+        for part in re.split(pattern, file_name):
+            normalized = Observatories.normalize_name(part)
+            for obs in Observatories.get_observatories():
+                if normalized.lower() == obs.lower():
+                    return obs
         return None
     
     @staticmethod

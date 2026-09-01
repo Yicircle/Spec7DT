@@ -7,7 +7,10 @@ class CutRegion:
     @classmethod
     def get_shape(cls, box_size, image_data, galaxy_name, observatory, band, image_set, cut_coeff):
         if (box_size is None) or (not box_size):
-            x, y, a, b, th = useful_functions.get_galaxy_radius(image_data)
+            x, y, a, b, th = useful_functions.get_galaxy_radius(
+                image_data,
+                context=f"{galaxy_name}/{observatory}/{band}",
+            )
             a = cut_coeff * a; b = cut_coeff * b
             box_size = (x, y, a, b, th)
             

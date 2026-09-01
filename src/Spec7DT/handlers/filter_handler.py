@@ -13,6 +13,7 @@ from .filter_properties import (
     prepare_filter_curve,
 )
 from .catalog_adapters import get_catalog_columns
+from ..utils.reporting import emit_alert, emit_detail
 
 
 def _get_svo_fps():
@@ -137,10 +138,17 @@ class Filters:
                         with resources.as_file(filepath) as file_path:
                             cls._load_from_file(file_path, source_type='default')
                     except Exception as e:
-                        print(f"Warning: Failed to load {filepath.name}: {str(e)}")
+                        emit_alert(
+                            f"Failed to load bundled filter curve: {e}",
+                            context=filepath.name,
+                            dedupe_key=f"filter.bundled.{filepath.name}",
+                        )
             cls._predefined_loaded = True
         except Exception as e:
-            print(f"Warning: Could not load predefined filters: {str(e)}")
+            emit_alert(
+                f"Could not load bundled filter curves: {e}",
+                dedupe_key="filter.bundled_collection",
+            )
     
     @classmethod
     def _load_from_file(
@@ -342,6 +350,7 @@ class Filters:
                       allow_svo: bool = True,
                       cache: bool = True,
                       cache_dir: Union[str, Path, None] = None,
+                      unknown_policy: Optional[str] = None,
                       warn: bool = True) -> FilterCurve:
         """
         Ensure a filter curve is available from registry/local references, cache, or SVO.
@@ -413,6 +422,7 @@ class Filters:
                                      allow_svo: bool = True,
                                      cache: bool = True,
                                      cache_dir: Union[str, Path, None] = None,
+                                     unknown_policy: str = "best_effort",
                                      warn: bool = True) -> dict[str, list[str]]:
         """
         Preload all filter curves referenced by a GalaxyImageSet-like data tree.
@@ -436,10 +446,13 @@ class Filters:
                             allow_svo=allow_svo,
                             cache=cache,
                             cache_dir=cache_dir,
+                            unknown_policy=unknown_policy,
                             warn=warn,
                         )
                         loaded.append(curve.name)
                     except Exception as exc:
+                        if unknown_policy == "strict":
+                            raise
                         label = f"{observatory}.{band}"
                         missing.append(label)
                         if warn:
@@ -569,7 +582,7 @@ class Filters:
         )
         
         cls._filters[name] = curve
-        print(f"Added custom filter: {name}")
+        emit_detail(f"Added custom filter: {name}")
 
     @classmethod
     def _matching_filter_keys(cls, name: str,
@@ -588,10 +601,13 @@ class Filters:
         if facility and instrument:
             candidates.append(f"{facility}/{instrument}.{name}".lower())
             candidates.append(f"{facility}.{instrument}.{name}".lower())
+            candidates.append(f"{facility}_{instrument}_{name}".lower())
         if facility:
             candidates.append(f"{facility}.{name}".lower())
+            candidates.append(f"{facility}_{name}".lower())
         if instrument:
             candidates.append(f"{instrument}.{name}".lower())
+            candidates.append(f"{instrument}_{name}".lower())
 
         for candidate in candidates:
             matches = [key for key in keys if key.lower() == candidate]
@@ -601,7 +617,7 @@ class Filters:
         matches = []
         for key in keys:
             key_lower = key.lower()
-            band = key_lower.split('/')[-1].split('.')[-1]
+            band = key_lower.split('/')[-1].split('.')[-1].split('_')[-1]
             if band != name_lower:
                 continue
             if facility and facility.lower() not in key_lower:

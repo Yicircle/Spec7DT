@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 import os
 import warnings
+from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import astropy.units as u
 import numpy as np
 from astropy.coordinates import SkyCoord
+from astropy.io.votable import parse_single_table
+from astropy.wcs import WCS
 
 
 class GalaxyMetadataError(RuntimeError):
@@ -23,7 +28,8 @@ class GalaxyMetadataError(RuntimeError):
         super().__init__(
             f"Could not resolve {metadata_type} for '{galaxy_name}'. "
             f"Tried: {sources}. Provide galaxy_metadata={{'{galaxy_name}': "
-            "{'coord': (ra_deg, dec_deg), 'redshift': z}}} or configure a "
+            "{'coord': (ra_deg, dec_deg), 'redshift': z, 'distance': mpc}}} "
+            "or configure a "
             "local metadata cache."
         )
 
@@ -54,7 +60,11 @@ class GalaxyMetadataConfig:
 
 
 class GalaxyMetadataResolver:
-    """Resolve galaxy coordinates and redshifts with configurable fallbacks."""
+    """Resolve galaxy coordinates, redshifts, and distances with fallbacks."""
+
+    _NED_OVERVIEW_URL = "https://ned.ipac.caltech.edu/NED::API/OverviewOfObject"
+    _CACHE_SCHEMA_KEY = "__schema_version__"
+    _CACHE_SCHEMA_VERSION = 3
 
     def __init__(
         self,
@@ -71,33 +81,76 @@ class GalaxyMetadataResolver:
         self._simbad_client = simbad_client
         self._cache = self._load_cache()
         self._remote_results: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_coord_source: dict[str, str] = {}
 
-    def get_coord(self, galaxy_name: str, header: Any | None = None, required: bool = True) -> tuple[float, float] | None:
+    def get_coord(
+        self,
+        galaxy_name: str,
+        header: Any | None = None,
+        required: bool = True,
+        image_shape: tuple[int, int] | None = None,
+    ) -> tuple[float, float] | None:
         tried = []
         for source in self.config.fallback_order:
             if source == "remote":
-                coord, remote_tried = self._remote_value(galaxy_name, "coord")
-                tried.extend(remote_tried)
-                if coord is not None:
-                    return coord
+                if not self.config.use_remote:
+                    tried.append("remote disabled")
+                    continue
+                for remote_source in self.config.remote_sources:
+                    label = remote_source.upper()
+                    tried.append(label)
+                    record = self._query_remote_source(galaxy_name, remote_source.lower())
+                    coord = self._record_coord(record)
+                    if self._accept_coord(
+                        galaxy_name,
+                        label,
+                        coord,
+                        header=header,
+                        image_shape=image_shape,
+                    ):
+                        self._cache_remote_record(galaxy_name, record, coord=coord)
+                        self._last_coord_source[galaxy_name] = label
+                        return coord
+                    self._cache_remote_record(galaxy_name, record)
             elif source == "manual":
                 tried.append("manual")
                 coord = self._record_coord(self.manual.get(galaxy_name))
-                if coord is not None:
+                if self._accept_coord(
+                    galaxy_name,
+                    "manual",
+                    coord,
+                    header=header,
+                    image_shape=image_shape,
+                ):
+                    self._last_coord_source[galaxy_name] = "manual"
                     return coord
             elif source == "header":
                 if header is None:
                     continue
                 tried.append("header")
                 coord = self._coord_from_header(header)
-                if coord is not None:
+                if self._accept_coord(
+                    galaxy_name,
+                    "header",
+                    coord,
+                    header=header,
+                    image_shape=image_shape,
+                ):
+                    self._last_coord_source[galaxy_name] = "header"
                     return coord
             elif source == "cache":
                 if not self.config.cache:
                     continue
                 tried.append("cache")
                 coord = self._record_coord(self._cache.get(galaxy_name))
-                if coord is not None:
+                if self._accept_coord(
+                    galaxy_name,
+                    "cache",
+                    coord,
+                    header=header,
+                    image_shape=image_shape,
+                ):
+                    self._last_coord_source[galaxy_name] = "cache"
                     return coord
             else:
                 tried.append(f"{source} ignored")
@@ -107,11 +160,78 @@ class GalaxyMetadataResolver:
         self._warn(f"Could not resolve coordinate for {galaxy_name}; continuing without it.")
         return None
 
-    def get_skycoord(self, galaxy_name: str, header: Any | None = None, required: bool = True) -> SkyCoord | None:
-        coord = self.get_coord(galaxy_name, header=header, required=required)
+    def get_skycoord(
+        self,
+        galaxy_name: str,
+        header: Any | None = None,
+        required: bool = True,
+        image_shape: tuple[int, int] | None = None,
+    ) -> SkyCoord | None:
+        coord = self.get_coord(
+            galaxy_name,
+            header=header,
+            required=required,
+            image_shape=image_shape,
+        )
         if coord is None:
             return None
         return SkyCoord(ra=coord[0] * u.deg, dec=coord[1] * u.deg, frame="icrs")
+
+    def get_coord_source(self, galaxy_name: str) -> str | None:
+        """Return the source used by the most recent coordinate resolution."""
+        return self._last_coord_source.get(galaxy_name)
+
+    def _accept_coord(
+        self,
+        galaxy_name: str,
+        source: str,
+        coord: tuple[float, float] | None,
+        *,
+        header: Any | None,
+        image_shape: tuple[int, int] | None,
+    ) -> bool:
+        if coord is None:
+            return False
+
+        ra, dec = coord
+        if not (np.isfinite(ra) and np.isfinite(dec) and 0.0 <= ra < 360.0 and -90.0 <= dec <= 90.0):
+            self._warn(
+                f"Rejected {source} coordinate for {galaxy_name}: {coord} is not a valid ICRS coordinate."
+            )
+            return False
+
+        if image_shape is None:
+            return True
+        if header is None:
+            self._warn(
+                f"Rejected {source} coordinate for {galaxy_name}: image bounds were supplied without a FITS header."
+            )
+            return False
+
+        try:
+            skycoord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+            x, y = WCS(header).world_to_pixel(skycoord)
+            height, width = tuple(image_shape)[-2:]
+            inside = (
+                np.isfinite(x)
+                and np.isfinite(y)
+                and 0.0 <= float(x) < float(width)
+                and 0.0 <= float(y) < float(height)
+            )
+        except Exception as exc:
+            self._warn(
+                f"Rejected {source} coordinate for {galaxy_name}: {coord} could not be projected "
+                f"into the image ({exc})."
+            )
+            return False
+
+        if not inside:
+            self._warn(
+                f"Rejected {source} coordinate for {galaxy_name}: {coord} projects to "
+                f"({x}, {y}), outside image shape {tuple(image_shape)}."
+            )
+            return False
+        return True
 
     def get_redshift(self, galaxy_name: str) -> float | None:
         for source in self.config.fallback_order:
@@ -133,6 +253,27 @@ class GalaxyMetadataResolver:
         self._warn(f"Could not resolve redshift for {galaxy_name}; using NaN.")
         return None
 
+    def get_distance(self, galaxy_name: str) -> float | None:
+        """Return the preferred NED distance in Mpc, if available."""
+        for source in self.config.fallback_order:
+            if source == "remote":
+                distance, _ = self._remote_value(galaxy_name, "distance")
+                if distance is not None:
+                    return distance
+            elif source == "manual":
+                distance = self._record_distance(self.manual.get(galaxy_name))
+                if distance is not None:
+                    return distance
+            elif source == "cache":
+                if not self.config.cache:
+                    continue
+                distance = self._record_distance(self._cache.get(galaxy_name))
+                if distance is not None:
+                    return distance
+
+        self._warn(f"Could not resolve distance for {galaxy_name}; using NaN.")
+        return None
+
     def _load_cache(self) -> dict[str, dict[str, Any]]:
         if not self.config.cache:
             return {}
@@ -148,7 +289,17 @@ class GalaxyMetadataResolver:
         if not isinstance(data, dict):
             self._warn(f"Metadata cache {path} does not contain a JSON object.")
             return {}
-        return self._normalize_metadata(data)
+        cache_version = data.pop(self._CACHE_SCHEMA_KEY, None)
+        normalized = self._normalize_metadata(data)
+        if cache_version != self._CACHE_SCHEMA_VERSION:
+            for record in normalized.values():
+                record.pop("coord", None)
+            self._warn(
+                "Ignoring coordinates from a pre-v3 metadata cache because older SIMBAD "
+                "responses may have been interpreted with the wrong RA unit; redshift and "
+                "distance values were preserved."
+            )
+        return normalized
 
     def _save_cache(self) -> None:
         if not self.config.cache:
@@ -156,8 +307,9 @@ class GalaxyMetadataResolver:
         path = self.config.resolved_cache_path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {self._CACHE_SCHEMA_KEY: self._CACHE_SCHEMA_VERSION, **self._cache}
             with path.open("w", encoding="utf-8") as file:
-                json.dump(self._cache, file, indent=2, sort_keys=True)
+                json.dump(payload, file, indent=2, sort_keys=True)
         except Exception as exc:
             self._warn(f"Could not write metadata cache {path}: {exc}")
 
@@ -174,11 +326,51 @@ class GalaxyMetadataResolver:
                 value = self._record_coord(record)
             elif value_type == "redshift":
                 value = self._record_redshift(record)
+            elif value_type == "distance":
+                value = self._record_distance(record)
             else:
                 value = None
             if value is not None:
+                self._cache_remote_value(galaxy_name, value_type, value)
                 return value, tried
         return None, tried
+
+    def _cache_remote_record(
+        self,
+        galaxy_name: str,
+        record: dict[str, Any],
+        *,
+        coord: tuple[float, float] | None = None,
+    ) -> None:
+        """Cache independently validated fields from a coordinate lookup."""
+        if not self.config.cache or not record:
+            return
+
+        validated: dict[str, Any] = {}
+        if coord is not None:
+            validated["coord"] = [float(coord[0]), float(coord[1])]
+        redshift = self._record_redshift(record)
+        if redshift is not None:
+            validated["redshift"] = redshift
+        distance = self._record_distance(record)
+        if distance is not None:
+            validated["distance"] = distance
+        self._update_cache(galaxy_name, validated)
+
+    def _cache_remote_value(self, galaxy_name: str, value_type: str, value: Any) -> None:
+        """Cache only the scalar field requested by a scalar metadata lookup."""
+        if value_type not in {"redshift", "distance"}:
+            return
+        self._update_cache(galaxy_name, {value_type: value})
+
+    def _update_cache(self, galaxy_name: str, values: dict[str, Any]) -> None:
+        if not self.config.cache or not values:
+            return
+        cached = self._cache.setdefault(galaxy_name, {})
+        if all(cached.get(key) == value for key, value in values.items()):
+            return
+        cached.update(values)
+        self._save_cache()
 
     def _query_remote_source(self, galaxy_name: str, source: str) -> dict[str, Any]:
         cache_key = (source, galaxy_name)
@@ -207,17 +399,23 @@ class GalaxyMetadataResolver:
             return {}
 
         self._remote_results[cache_key] = result
-        if self.config.cache:
-            cached = self._cache.setdefault(galaxy_name, {})
-            cached.update(result)
-            self._save_cache()
         return result
 
     def _query_ned(self, galaxy_name: str) -> dict[str, Any]:
-        client = self._get_ned_client()
-        self._set_client_timeout(client)
-        table = client.query_object(galaxy_name)
+        if self._ned_client is not None:
+            client = self._get_ned_client()
+            self._set_client_timeout(client)
+            table = client.query_object(galaxy_name)
+        else:
+            table = self._query_ned_overview(galaxy_name)
         return self._metadata_from_ned_table(table)
+
+    def _query_ned_overview(self, galaxy_name: str):
+        query = urlencode({"TARGET": galaxy_name})
+        url = f"{self._NED_OVERVIEW_URL}?{query}"
+        with urlopen(url, timeout=self.config.timeout) as response:
+            payload = response.read()
+        return parse_single_table(BytesIO(payload)).to_table(use_names_over_ids=True)
 
     def _query_simbad(self, galaxy_name: str) -> dict[str, Any]:
         client = self._get_simbad_client()
@@ -265,21 +463,97 @@ class GalaxyMetadataResolver:
             return {}
 
         result: dict[str, Any] = {}
-        try:
-            coord = self._coord_from_value((table["RA"][0], table["DEC"][0]))
-            if coord is not None:
-                result["coord"] = [coord[0], coord[1]]
-        except Exception:
-            pass
+        coord = self._ned_equatorial_coord(table)
+        if coord is not None:
+            result["coord"] = [coord[0], coord[1]]
 
-        try:
-            redshift = self._redshift_from_value(table["Redshift"][0])
-            if redshift is not None:
-                result["redshift"] = redshift
-        except Exception:
-            pass
+        redshift = self._redshift_from_value(
+            self._first_table_value(table, "Redshift", "Redshift (z)")
+        )
+        if redshift is not None:
+            result["redshift"] = redshift
+
+        mean_distance = self._distance_from_value(
+            self._first_table_value(table, "Mean Distance", "Mean_Distance")
+        )
+        cmb_distance = self._distance_from_value(
+            self._first_table_value(table, "D (3K CMB)", "D_3K_CMB")
+        )
+        distance = mean_distance if mean_distance is not None else cmb_distance
+        if distance is not None:
+            result["distance"] = distance
 
         return result
+
+    def _ned_equatorial_coord(self, table: Any) -> tuple[float, float] | None:
+        """Read NED's decimal-degree coordinate pair before sexagesimal fields."""
+        ra_column = self._ned_degree_column(table, axis="ra")
+        dec_column = self._ned_degree_column(table, axis="dec")
+        if ra_column is not None and dec_column is not None:
+            try:
+                coord = self._coord_from_value((table[ra_column][0], table[dec_column][0]))
+            except Exception:
+                coord = None
+            if coord is not None:
+                return coord
+
+        names = self._table_colnames(table)
+        ra_sex = self._first_matching_column(
+            names,
+            "Lon (Equatorial J2000) in sexagesimal",
+            "RA-s",
+        )
+        dec_sex = self._first_matching_column(
+            names,
+            "Lat (Equatorial J2000) in sexagesimal",
+            "Dec-s",
+        )
+        if ra_sex is None or dec_sex is None:
+            return None
+        try:
+            coord = SkyCoord(
+                table[ra_sex][0],
+                table[dec_sex][0],
+                unit=(u.hourangle, u.deg),
+                frame="icrs",
+            )
+        except Exception:
+            return None
+        return float(coord.ra.deg), float(coord.dec.deg)
+
+    def _ned_degree_column(self, table: Any, axis: str) -> str | None:
+        names = sorted(self._table_colnames(table))
+        scored: list[tuple[int, str]] = []
+        for name in names:
+            normalized = self._normalize_column_name(name)
+            is_ra = normalized == "ra" or (
+                normalized.startswith("lonequatorialj2000") and "sexagesimal" not in normalized
+            )
+            is_dec = normalized == "dec" or (
+                normalized.startswith("latequatorialj2000") and "sexagesimal" not in normalized
+            )
+            if (axis == "ra" and not is_ra) or (axis == "dec" and not is_dec):
+                continue
+
+            try:
+                column = table[name]
+                value = column[0]
+            except Exception:
+                continue
+            try:
+                numeric = np.issubdtype(np.asarray(value).dtype, np.number)
+            except TypeError:
+                numeric = False
+            unit = getattr(column, "unit", None)
+            unit_is_degree = unit is not None and str(unit).lower() in {"deg", "degree"}
+            if not numeric:
+                continue
+            score = (100 if unit_is_degree else 0) + (20 if "equatorialj2000" in normalized else 0)
+            scored.append((score, name))
+
+        if not scored:
+            return None
+        return max(scored)[1]
 
     def _metadata_from_simbad_table(self, table: Any) -> dict[str, Any]:
         try:
@@ -294,7 +568,7 @@ class GalaxyMetadataResolver:
         dec_key = self._first_matching_column(names, "DEC", "dec")
         if ra_key is not None and dec_key is not None:
             try:
-                coord = self._coord_from_simbad_value((table[ra_key][0], table[dec_key][0]))
+                coord = self._coord_from_simbad_columns(table, ra_key, dec_key)
                 if coord is not None:
                     result["coord"] = [coord[0], coord[1]]
             except Exception:
@@ -314,6 +588,46 @@ class GalaxyMetadataResolver:
 
         return result
 
+    def _coord_from_simbad_columns(
+        self,
+        table: Any,
+        ra_key: str,
+        dec_key: str,
+    ) -> tuple[float, float] | None:
+        ra_column = table[ra_key]
+        dec_column = table[dec_key]
+        ra_value = ra_column[0]
+        dec_value = dec_column[0]
+
+        if self._is_numeric_coord_pair(ra_value, dec_value):
+            ra = self._numeric_angle_to_degree(
+                ra_value,
+                getattr(ra_column, "unit", None),
+                default_unit=u.deg,
+            )
+            dec = self._numeric_angle_to_degree(
+                dec_value,
+                getattr(dec_column, "unit", None),
+                default_unit=u.deg,
+            )
+            return self._coord_from_value((ra, dec))
+
+        return self._coord_from_simbad_value((ra_value, dec_value))
+
+    @staticmethod
+    def _is_numeric_coord_pair(ra_value: Any, dec_value: Any) -> bool:
+        if np.ma.is_masked(ra_value) or np.ma.is_masked(dec_value):
+            return False
+        try:
+            return np.isfinite(float(ra_value)) and np.isfinite(float(dec_value))
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _numeric_angle_to_degree(value: Any, unit: Any, *, default_unit: u.Unit) -> float:
+        angle_unit = default_unit if unit is None else u.Unit(unit)
+        return float((float(value) * angle_unit).to_value(u.deg))
+
     def _table_colnames(self, table: Any) -> set[str]:
         names = getattr(table, "colnames", None)
         if names is not None:
@@ -324,13 +638,30 @@ class GalaxyMetadataResolver:
 
     def _first_matching_column(self, names: set[str], *candidates: str) -> str | None:
         lower_names = {name.lower(): name for name in names}
+        normalized_names = {self._normalize_column_name(name): name for name in names}
         for candidate in candidates:
             if candidate in names:
                 return candidate
             match = lower_names.get(candidate.lower())
             if match is not None:
                 return match
+            match = normalized_names.get(self._normalize_column_name(candidate))
+            if match is not None:
+                return match
         return None
+
+    @staticmethod
+    def _normalize_column_name(name: str) -> str:
+        return "".join(character.lower() for character in str(name) if character.isalnum())
+
+    def _first_table_value(self, table: Any, *candidates: str) -> Any | None:
+        column = self._first_matching_column(self._table_colnames(table), *candidates)
+        if column is None:
+            return None
+        try:
+            return table[column][0]
+        except Exception:
+            return None
 
     def _normalize_metadata(self, metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
         normalized: dict[str, dict[str, Any]] = {}
@@ -349,8 +680,12 @@ class GalaxyMetadataResolver:
                 if coord_value is None and "ra" in record and "dec" in record:
                     coord_value = (record["ra"], record["dec"])
                 redshift_value = record.get("redshift", record.get("z"))
+                distance_value = record.get("distance", record.get("distance_mpc"))
             else:
                 continue
+
+            if not isinstance(record, dict):
+                distance_value = None
 
             coord = self._coord_from_value(coord_value)
             if coord is not None:
@@ -359,6 +694,10 @@ class GalaxyMetadataResolver:
             redshift = self._redshift_from_value(redshift_value)
             if redshift is not None:
                 normalized_record["redshift"] = redshift
+
+            distance = self._distance_from_value(distance_value)
+            if distance is not None:
+                normalized_record["distance"] = distance
 
             if normalized_record:
                 normalized[str(galaxy_name)] = normalized_record
@@ -374,6 +713,11 @@ class GalaxyMetadataResolver:
             return None
         return self._redshift_from_value(record.get("redshift"))
 
+    def _record_distance(self, record: dict[str, Any] | None) -> float | None:
+        if not record:
+            return None
+        return self._distance_from_value(record.get("distance"))
+
     def _coord_from_header(self, header: Any) -> tuple[float, float] | None:
         for ra_key, dec_key in (("RA", "DEC"), ("OBJRA", "OBJDEC")):
             try:
@@ -387,11 +731,13 @@ class GalaxyMetadataResolver:
     def _coord_from_simbad_value(self, value: Any) -> tuple[float, float] | None:
         if value is None or not isinstance(value, (list, tuple, np.ndarray)) or len(value) < 2:
             return self._coord_from_value(value)
+        if self._is_numeric_coord_pair(value[0], value[1]):
+            return self._coord_from_value(value)
         try:
             coord = SkyCoord(value[0], value[1], unit=(u.hourangle, u.deg), frame="icrs")
             return float(coord.ra.deg), float(coord.dec.deg)
         except Exception:
-            return self._coord_from_value(value)
+            return None
 
     def _coord_from_value(self, value: Any) -> tuple[float, float] | None:
         if value is None:
@@ -409,7 +755,12 @@ class GalaxyMetadataResolver:
         try:
             ra = float(ra_value)
             dec = float(dec_value)
-            if np.isfinite(ra) and np.isfinite(dec):
+            if (
+                np.isfinite(ra)
+                and np.isfinite(dec)
+                and 0.0 <= ra < 360.0
+                and -90.0 <= dec <= 90.0
+            ):
                 return ra, dec
         except Exception:
             pass
@@ -429,9 +780,20 @@ class GalaxyMetadataResolver:
             redshift = float(value)
         except Exception:
             return None
-        if np.isnan(redshift):
+        if not np.isfinite(redshift):
             return None
         return redshift
+
+    def _distance_from_value(self, value: Any) -> float | None:
+        if value is None or np.ma.is_masked(value):
+            return None
+        try:
+            distance = float(value)
+        except Exception:
+            return None
+        if not np.isfinite(distance) or distance <= 0:
+            return None
+        return distance
 
     def _warn(self, message: str) -> None:
         if self.config.warn:

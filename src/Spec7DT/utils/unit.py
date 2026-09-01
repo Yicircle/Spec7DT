@@ -1,7 +1,6 @@
 import numpy as np
 import warnings
-from .utility import useful_functions
-warnings.filterwarnings("ignore", category=RuntimeWarning) 
+from .utility import Observatories, useful_functions
 
 class conversion:
     def __init__(self):
@@ -12,12 +11,19 @@ class conversion:
                          'Spitzer': self.Spitzer,
                          'WISE': self.WISE,
                          '2MASS': self.TMASS,
+                         'UKIRT': self.UKIRT,
                          'SPHEREx': self.SPHEREx,
                          'PACS': self.pacs,
                          'SPIRE': self.spire
                          }
+        self.supported_bands = {
+            "GALEX": {"FUV", "NUV"},
+            "WISE": {"w1", "w2", "w3", "w4"},
+            "2MASS": {"j", "h", "k", "ks"},
+            "UKIRT": {"Y", "J", "H", "K"},
+        }
     
-    def unitConvertor(self, image_data, header, error_data, galaxy_name, observatory, band, image_set):
+    def unitConvertor(self, image_data, header, error_data, galaxy_name, observatory, band, image_set, filter_config=None):
         """
         Convert image data to consistent flux units based on observatory and band.
         
@@ -40,13 +46,30 @@ class conversion:
             Converted flux data in mJy
         """
         
+        filter_config = filter_config or {}
+        unknown_policy = filter_config.get("unknown_policy", "best_effort")
+        conversion_observatory = Observatories.normalize_name(observatory)
+
         # Check if observatory is supported
-        if observatory not in self.obs_match:
-            raise ValueError(f"Observatory '{observatory}' not supported. "
-                           f"Available observatories: {list(self.obs_match.keys())}")
+        if conversion_observatory not in self.obs_match:
+            message = (
+                f"Observatory '{observatory}' not supported. "
+                f"Available observatories: {list(self.obs_match.keys())}"
+            )
+            if unknown_policy == "strict":
+                raise ValueError(message)
+            warnings.warn(f"Skipping unit conversion for {galaxy_name}/{observatory}/{band}: {message}")
+            return
+
+        if self._unsupported_band(conversion_observatory, band):
+            message = f"Filter '{band}' not supported for observatory '{conversion_observatory}'."
+            if unknown_policy == "strict":
+                raise ValueError(message)
+            warnings.warn(f"Skipping unit conversion for {galaxy_name}/{observatory}/{band}: {message}")
+            return
         
         # Get the conversion function
-        conversion_func = self.obs_match[observatory]
+        conversion_func = self.obs_match[conversion_observatory]
         
         try:
             # All functions now have standardized signature
@@ -56,9 +79,15 @@ class conversion:
             image_set.update_data(convert_im.astype(np.float32), galaxy_name, observatory, band)
             image_set.update_error(convert_err.astype(np.float32), galaxy_name, observatory, band)
                 
-        except Exception as e:
-            print(f"Error converting data for {galaxy_name} from {observatory} {band}: {str(e)}")
+        except Exception:
             raise
+
+    def _unsupported_band(self, observatory, band):
+        supported = self.supported_bands.get(observatory)
+        if supported is None:
+            return False
+        band = "" if band is None else str(band)
+        return band.lower() not in {value.lower() for value in supported}
     
     # UVs
     def GALEX(self, image_data, header=None, band=None):
@@ -141,6 +170,38 @@ class conversion:
         mag = -2.5 * np.log10(image_data) + zp_2mass[header.get("FILTER", band.lower())]
         f_nu = 10 ** (-0.4 * mag) * zpflux_2mass[header.get("FILTER", band.lower())] * 1e3  # [mJy]
         return f_nu
+
+    def UKIRT(self, image_data, header, band=None):  # ADU
+        zero_point_flux = {
+            'Y': 2092,
+            'J': 1570,
+            'H': 1019,
+            'K': 653,
+        }
+
+        band = str(band).strip().upper()
+        try:
+            magnitude_zero_point = float(header['MAGZPT'])
+        except KeyError as exc:
+            raise KeyError("Magnitude zero point 'MAGZPT' is not found.") from exc
+        try:
+            exposure_time = float(header['EXP_TIME'])
+        except KeyError as exc:
+            raise KeyError("Exposure time 'EXP_TIME' is not found.") from exc
+
+        if exposure_time <= 0:
+            raise ValueError("Exposure time 'EXP_TIME' must be positive.")
+
+        # Equivalent to converting ADU/exposure_time to a Vega magnitude and
+        # then converting that magnitude to mJy. Keeping the expression linear
+        # also makes it valid for uncertainty maps and background-subtracted data.
+        conversion_factor = (
+            1e3
+            * zero_point_flux[band]
+            * 10 ** (-0.4 * magnitude_zero_point)
+            / exposure_time
+        )
+        return np.asarray(image_data) * conversion_factor
     
     # sub-mms
     def pacs(self, image_data, header=None, band=None):  # Jy/pixel

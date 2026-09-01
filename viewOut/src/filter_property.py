@@ -8,6 +8,7 @@ from Spec7DT.handlers import (
     FilterPropertyCalculator,
     Filters as _CoreFilters,
 )
+from Spec7DT.utils.utility import Observatories as _CoreObservatories
 
 
 class Observatories:
@@ -24,7 +25,7 @@ class Observatories:
         return ["HST", "SDSS", "PS1", "CFHT", "DECam", "DES", "LSST", "Pan-STARRS", "Subaru", "7DT", "SkyMapper", "sloan"]
 
     def _infrareds(self):
-        return ["WISE", "Spitzer", "Herschel", "JWST", "VISTA", "UKIDSS", "2MASS", "SPHEREx", "SPIRE", "PACS", "spire", "pacs", "wise"]
+        return ["WISE", "Spitzer", "Herschel", "JWST", "VISTA", "UKIRT", "2MASS", "SPHEREx", "SPIRE", "PACS", "spire", "pacs", "wise"]
 
     def _ultraviolet(self):
         return ["GALEX", "HST", "FUSE", "galex"]
@@ -35,6 +36,8 @@ class Observatories:
     @classmethod
     def get_observatories(cls):
         return cls().observatories
+
+    normalize_name = _CoreObservatories.normalize_name
 
 
 class CurveProp:
