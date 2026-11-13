@@ -360,6 +360,17 @@ class Filters:
         except (KeyError, ValueError):
             pass
 
+        # SPHEREx mosaic channels have an authoritative packaged response
+        # library. Resolve those locally before consulting user caches or SVO.
+        try:
+            from .spherex_response import ensure_local_spherex_filter
+
+            local_spherex = ensure_local_spherex_filter(cls, name, facility)
+        except KeyError:
+            local_spherex = None
+        if local_spherex is not None:
+            return local_spherex
+
         if cache:
             try:
                 cached = cls._load_from_cache(
@@ -560,9 +571,13 @@ class Filters:
     
     @classmethod
     def add_custom(cls, name: str, wavelength: np.ndarray, response: np.ndarray, 
-                   unit_type: str = 'photon', description: str = ''):
+                   unit_type: str = 'photon', description: str = '',
+                   announce: bool = True):
         """
         Add custom filter from arrays.
+
+        ``announce=False`` is useful for trusted filter libraries that register
+        many curves as one operation.
         
         Args:
             name: Filter name
@@ -570,6 +585,7 @@ class Filters:
             response: Transmission/response array
             unit_type: 'photon' or 'energy'
             description: Optional description
+            announce: Emit the normal one-line registration detail
         """
         curve = FilterCurve(
             name=name,
@@ -582,7 +598,8 @@ class Filters:
         )
         
         cls._filters[name] = curve
-        emit_detail(f"Added custom filter: {name}")
+        if announce:
+            emit_detail(f"Added custom filter: {name}")
 
     @classmethod
     def _matching_filter_keys(cls, name: str,

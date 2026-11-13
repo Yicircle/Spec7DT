@@ -1,1 +1,2 @@
 recursive-include src/Spec7DT/reference/configs *.swarp
+recursive-include src/Spec7DT/reference/spherex *.csv

@@ -78,6 +78,11 @@ class conversion:
             
             image_set.update_data(convert_im.astype(np.float32), galaxy_name, observatory, band)
             image_set.update_error(convert_err.astype(np.float32), galaxy_name, observatory, band)
+            updated_header = header.copy()
+            updated_header["BUNIT"] = ("mJy", "Spec7DT flux density unit")
+            update_header = getattr(image_set, "update_header", None)
+            if callable(update_header):
+                update_header(updated_header, galaxy_name, observatory, band)
                 
         except Exception:
             raise

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='Spec7DT',
-    version='0.14.0',
+    version='0.15.0',
     description='Spectral image handling package for 7-Dimensional Telescope users by Won-Hyeong Lee',
     author='Won-Hyeong Lee',
     author_email='wohy1220@gmail.com',
@@ -16,15 +16,22 @@ setup(
         'reproject>=0.20,<0.21',
         'pandas>=2.3,<3',
         'astroquery>=0.4.11,<0.5',
+        'requests>=2.31,<3',
         'dustmaps>=1.0.14,<2',
         'rich>=13.7,<16',
     ],
+    extras_require={
+        'sed-drill': [
+            'panel>=1.2,<2',
+        ],
+    },
     packages=find_packages(where='src'),
     include_package_data=True,
     package_data={
         "Spec7DT": [
             # "reference/filter_curves/*.dat",
             # "reference/psfs/*.fits",
+            "reference/spherex/*/MeanAllPixel/SubChannel17/Band*/*.csv",
             "reference/configs/*.swarp",
         ],
     },

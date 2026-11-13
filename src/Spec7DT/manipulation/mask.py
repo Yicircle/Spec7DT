@@ -118,6 +118,17 @@ class Masking:
         from ..reduction.PSF import PointSpreadFunction
 
         fallback = None if gaia_config is None else gaia_config.get("fallback_fwhm_arcsec")
+        safe_values = []
+        for bands in getattr(image_set, "psf_match", {}).get(galaxy_name, {}).values():
+            for result in bands.values():
+                try:
+                    value = float(result.target_psf.fwhm_arcsec)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if np.isfinite(value) and value > 0:
+                    safe_values.append(value)
+        if safe_values:
+            return float(np.nanmax(safe_values))
         try:
             return PointSpreadFunction.target_fwhm(image_set, galaxy_name)
         except ValueError as exc:
@@ -359,6 +370,14 @@ class Masking:
 
     @classmethod
     def reference_psf_fwhm(cls, image_set, galaxy, observatory, band, gaia_config):
+        try:
+            value = float(
+                image_set.psf_match[galaxy][observatory][band].target_psf.fwhm_arcsec
+            )
+            if np.isfinite(value) and value > 0:
+                return value
+        except Exception:
+            pass
         try:
             value = float(image_set.psf[galaxy][observatory][band])
             if np.isfinite(value) and value > 0:

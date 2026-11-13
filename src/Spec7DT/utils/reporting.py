@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
+import re
 import warnings
 
 from rich.console import Console
@@ -19,6 +21,9 @@ from rich.table import Table
 
 
 _ACTIVE_REPORTER = ContextVar("spec7dt_pipeline_reporter", default=None)
+_TARGET_PATTERN = re.compile(
+    r"\b((?:NGC|IC|M)[A-Za-z0-9_.+-]*/[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+)"
+)
 
 
 @contextmanager
@@ -29,6 +34,28 @@ def reporter_context(reporter):
         yield reporter
     finally:
         _ACTIVE_REPORTER.reset(token)
+
+
+@contextmanager
+def pipeline_warning_context(reporter):
+    """Route ordinary Python warnings through the active pipeline reporter."""
+    with warnings.catch_warnings():
+        def showwarning(message, category, filename, lineno, file=None, line=None):
+            del file, line
+            rendered = str(message)
+            match = _TARGET_PATTERN.search(rendered)
+            target = match.group(1) if match is not None else None
+            normalized = rendered.replace(target, "{target}") if target else rendered
+            source = f"{Path(filename).name}:{lineno}"
+            reporter.alert(
+                normalized,
+                context=target or source,
+                dedupe_key=f"python-warning.{category.__name__}.{normalized}",
+                category=category,
+            )
+
+        warnings.showwarning = showwarning
+        yield
 
 
 def emit_detail(message):
@@ -71,10 +98,19 @@ def emit_alert(
 class RichPipelineReporter:
     """Render nested pipeline progress and a compact timing summary."""
 
-    def __init__(self, *, progress=True, verbose=False, show_alerts=True, console=None):
+    def __init__(
+        self,
+        *,
+        progress=True,
+        verbose=False,
+        show_alerts=True,
+        live_alerts=True,
+        console=None,
+    ):
         self.enabled = bool(progress)
         self.verbose = bool(verbose)
         self.show_alerts = bool(show_alerts)
+        self.live_alerts = bool(live_alerts)
         self.console = console or Console()
         self._progress = None
         self._overall_task = None
@@ -185,7 +221,7 @@ class RichPipelineReporter:
 
         if record["count"] != 1:
             return
-        if not self.show_alerts:
+        if not self.show_alerts or not self.live_alerts:
             return
         rendered = str(message)
         if context and str(context) not in rendered:
@@ -206,7 +242,7 @@ class RichPipelineReporter:
             self._progress.stop()
             self._progress = None
 
-    def summary(self, rows, *, pdf_path=None):
+    def summary(self, rows, *, pdf_path=None, checkpoint_dirs=None):
         table = Table(title="Pipeline summary")
         table.add_column("Step")
         table.add_column("Targets", justify="right")
@@ -239,3 +275,9 @@ class RichPipelineReporter:
             self.console.print(alerts)
         if pdf_path is not None:
             self.console.print(f"[green]Plot PDF:[/green] {pdf_path}")
+        if checkpoint_dirs:
+            for galaxy, path in sorted(checkpoint_dirs.items()):
+                self.console.print(
+                    f"[green]Checkpoint ({escape(str(galaxy))}):[/green] "
+                    f"{escape(str(path))}"
+                )

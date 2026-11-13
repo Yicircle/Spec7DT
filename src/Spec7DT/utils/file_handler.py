@@ -71,10 +71,16 @@ class GalaxyImageSet:
         self._error = {}
         self._error_source = {}
         self._psf = {}
+        self._safe_psf_models = {}
+        self._safe_psf_failures = {}
+        self._psf_match = {}
+        self._psf_ensembles = {}
+        self._product_metadata = {}
         self._cutout_shape = {}
         self._obs = {}
         self._files = {}
         self._last_catalog = None
+        self._pipeline_output_dirs = {}
         self.filter_inst = Filters()
         self.auto_ensure_filters = bool(auto_ensure_filters)
         self.unknown_policy = unknown_policy
@@ -100,7 +106,7 @@ class GalaxyImageSet:
         if self._last_catalog is None:
             raise RuntimeError(
                 "No pipeline catalog is available. Run execute_pipeline() before "
-                "plot_sed() or write_catalog()."
+                "plot_sed(), write_catalog(), or write_white_image()."
             )
         return self._last_catalog
 
@@ -114,7 +120,10 @@ class GalaxyImageSet:
         if not filepath.exists():
             raise FileNotFoundError(f"File {filepath} not found")
 
-        image_data, image_header = self._read_fits_image(filepath)
+        image_data, image_header, product_metadata = self._read_fits_image(
+            filepath,
+            return_product_metadata=True,
+        )
 
         
         file_name = filepath.stem
@@ -137,6 +146,15 @@ class GalaxyImageSet:
                 f"Skipping {filepath}: could not parse galaxy, observatory, and band."
             )
             return
+
+        from ..psf.products import finalize_product_metadata
+
+        product_metadata = finalize_product_metadata(
+            product_metadata,
+            facility=observatory,
+            channel=band,
+            source_path=filepath,
+        )
 
         existing_path = (
             self._files.get(galaxy_name, {})
@@ -161,6 +179,7 @@ class GalaxyImageSet:
             self._psf,
             self._cutout_shape,
             self._files,
+            self._product_metadata,
         ]:
             attr.setdefault(galaxy_name, {}).setdefault(observatory, {})
 
@@ -169,6 +188,7 @@ class GalaxyImageSet:
         self._psf[galaxy_name][observatory][band] = ""
         self._cutout_shape[galaxy_name][observatory][band] = set()
         self._files[galaxy_name][observatory][band] = str(filepath)
+        self._product_metadata[galaxy_name][observatory][band] = product_metadata
         self._invalidate_last_catalog()
 
         err_name = filepath.with_name(filepath.stem + "_err").with_suffix(filepath.suffix)
@@ -184,20 +204,128 @@ class GalaxyImageSet:
             self._error[galaxy_name][observatory][band] = error_data
             self._error_source[galaxy_name][observatory][band] = "file"
 
+    def add_array(
+        self,
+        image_data,
+        image_header,
+        *,
+        galaxy_name,
+        observatory,
+        band,
+        error=None,
+        source_path=None,
+        error_source="provided",
+        ensure_filter=None,
+        product_metadata=None,
+    ):
+        """Add one in-memory 2-D science/error band to this image set."""
+        if not all([galaxy_name, observatory, band]):
+            raise ValueError("galaxy_name, observatory, and band are required")
+
+        image = np.asarray(image_data, dtype=np.float32)
+        if image.ndim != 2 or image.size == 0:
+            raise ValueError(
+                f"Image data for {galaxy_name}/{observatory}/{band} must be a non-empty 2-D array"
+            )
+        uncertainty = None
+        if error is not None:
+            uncertainty = np.asarray(error, dtype=np.float32)
+            if uncertainty.shape != image.shape:
+                raise ValueError(
+                    f"Error shape {uncertainty.shape} does not match image shape {image.shape} "
+                    f"for {galaxy_name}/{observatory}/{band}"
+                )
+
+        try:
+            header = image_header.copy()
+        except AttributeError as exc:
+            raise TypeError("image_header must provide copy()") from exc
+
+        key = (str(galaxy_name), str(observatory), str(band))
+        source_label = (
+            str(source_path)
+            if source_path is not None
+            else f"<in-memory:{'/'.join(key)}>"
+        )
+        existing_path = (
+            self._files.get(key[0], {}).get(key[1], {}).get(key[2])
+        )
+        if key[2] in self._data.get(key[0], {}).get(key[1], {}):
+            raise DuplicateImageError(
+                {key: (existing_path or f"<in-memory:{'/'.join(key)}>", source_label)}
+            )
+
+        should_ensure = self.auto_ensure_filters if ensure_filter is None else bool(ensure_filter)
+        if should_ensure:
+            self._ensure_filter_for_image(source_label, key[1], key[2])
+
+        error_sources = self._error_sources()
+        for attr in (
+            self._data,
+            self._header,
+            self._error,
+            error_sources,
+            self._psf,
+            self._cutout_shape,
+            self._files,
+            self._product_metadata,
+        ):
+            attr.setdefault(key[0], {}).setdefault(key[1], {})
+
+        self._data[key[0]][key[1]][key[2]] = image
+        self._header[key[0]][key[1]][key[2]] = header
+        self._error[key[0]][key[1]][key[2]] = uncertainty
+        error_sources[key[0]][key[1]][key[2]] = (
+            "missing" if uncertainty is None else str(error_source or "provided")
+        )
+        self._psf[key[0]][key[1]][key[2]] = ""
+        self._cutout_shape[key[0]][key[1]][key[2]] = set()
+        self._files[key[0]][key[1]][key[2]] = source_label
+        from ..psf.models import ImageProductMetadata
+
+        self._product_metadata[key[0]][key[1]][key[2]] = ImageProductMetadata.from_value(
+            product_metadata,
+            facility=key[1],
+            channel=key[2],
+            source_path=None if source_path is None else str(source_path),
+        )
+        self._invalidate_last_catalog()
+
     @classmethod
-    def _read_fits_image(cls, filepath):
+    def _read_fits_image(cls, filepath, *, return_product_metadata=False):
         with fits.open(filepath) as hdul:
-            _, image_hdu = cls._find_image_hdu(hdul, filepath)
+            image_index, image_hdu = cls._find_image_hdu(hdul, filepath)
             image_data = np.array(image_hdu.data, dtype=np.float32)
             image_header = cls._merge_primary_and_image_headers(hdul[0].header, image_hdu.header)
+            if return_product_metadata:
+                from ..psf.products import infer_product_metadata
+
+                product_metadata = infer_product_metadata(
+                    hdul,
+                    filepath,
+                    image_index,
+                    image_header,
+                )
+        if return_product_metadata:
+            return image_data, image_header, product_metadata
         return image_data, image_header
 
     @classmethod
     def _find_image_hdu(cls, hdul, filepath):
         image_candidates = []
         marked_candidates = []
+        cube_candidates = []
 
         for index, hdu in enumerate(hdul):
+            data = getattr(hdu, "data", None)
+            shape = getattr(data, "shape", None)
+            if (
+                shape is not None
+                and len(shape) == 3
+                and np.prod(shape) > 0
+                and cls._has_image_extension_marker(hdu.header)
+            ):
+                cube_candidates.append((index, hdu))
             if not cls._is_2d_image_hdu(hdu):
                 continue
 
@@ -207,6 +335,14 @@ class GalaxyImageSet:
 
         if marked_candidates:
             return marked_candidates[0]
+        if cube_candidates:
+            cube_names = ", ".join(
+                str(hdu.header.get("EXTNAME", index)) for index, hdu in cube_candidates
+            )
+            raise ValueError(
+                f"3-D image cube detected in {filepath} ({cube_names}); "
+                "use ImageQuery.querySpherexCube() for a SPHEREx mosaic"
+            )
         if image_candidates:
             return image_candidates[0]
 
@@ -420,6 +556,20 @@ class GalaxyImageSet:
                 
                 for band, psf_data in bands.items():
                     self._psf[galaxy_name][observatory][band] = psf_data
+
+        # Safe PSF models and kernels are immutable analysis state. Preserve
+        # them when independently loaded image sets are combined.
+        for attribute in ("_safe_psf_models", "_psf_match", "_psf_ensembles", "_product_metadata"):
+            destination = getattr(self, attribute, None)
+            if destination is None:
+                destination = {}
+                setattr(self, attribute, destination)
+            for galaxy_name, observatories in getattr(other, attribute, {}).items():
+                for observatory, bands in observatories.items():
+                    destination.setdefault(galaxy_name, {}).setdefault(observatory, {}).update(bands)
+        if not hasattr(self, "_safe_psf_failures"):
+            self._safe_psf_failures = {}
+        self._safe_psf_failures.update(getattr(other, "_safe_psf_failures", {}))
         
         # Merge cutout_shape data
         for galaxy_name, observatories in other._cutout_shape.items():
@@ -492,6 +642,18 @@ class GalaxyImageSet:
     def files(self):
         """Read Only: Path of Files"""
         return self._files
+
+    @property
+    def product_metadata(self):
+        """Read-only per-image data-product identity and PSF capabilities."""
+        if not hasattr(self, "_product_metadata"):
+            self._product_metadata = {}
+        return self._product_metadata
+
+    @property
+    def pipeline_output_dirs(self):
+        """Read-only mapping of galaxies to the latest checkpoint run directories."""
+        return dict(getattr(self, "_pipeline_output_dirs", {}))
     
     @property
     def data(self):
@@ -543,6 +705,13 @@ class GalaxyImageSet:
     @property
     def psf(self):
         return self._psf
+
+    @property
+    def psf_match(self):
+        """Read-only safe PSF model, target, kernel, and QC tree."""
+        if not hasattr(self, "_psf_match"):
+            self._psf_match = {}
+        return self._psf_match
     
     @psf.setter
     def psf(self, value_tuple):
@@ -661,6 +830,27 @@ class GalaxyImageSet:
             invalid_values=invalid_values,
         )
 
+    def sed_drill(
+        self,
+        galaxy,
+        *,
+        strict_wcs=True,
+        invalid_values=(99.0, -99.0),
+    ):
+        """Create a single-galaxy interactive SED drilling data session.
+
+        The returned session is widget-independent; use the optional notebook
+        frontend in ``test/sed_drill.py`` or any custom viewer to render it.
+        """
+        from ..sed_drill import SedDrillSession
+
+        return SedDrillSession.from_image_set(
+            self,
+            galaxy,
+            strict_wcs=strict_wcs,
+            invalid_values=invalid_values,
+        )
+
     def write_catalog(
         self,
         output_path,
@@ -670,9 +860,14 @@ class GalaxyImageSet:
         galaxy_metadata=None,
         metadata_config=None,
         invalid_values=(99.0, -99.0),
+        include_drill_metadata=False,
         overwrite=False,
     ):
-        """Write the latest pipeline catalog as per-galaxy FITS/ASCII tables."""
+        """Write the latest pipeline catalog as per-galaxy FITS/ASCII tables.
+
+        With ``include_drill_metadata=True``, FITS files receive drilling
+        metadata extensions and ASCII files receive per-galaxy JSON sidecars.
+        """
         catalog_frame = self._require_last_catalog()
         return write_image_set_catalog(
             self,
@@ -683,6 +878,25 @@ class GalaxyImageSet:
             galaxy_metadata=galaxy_metadata,
             metadata_config=metadata_config,
             invalid_values=invalid_values,
+            include_drill_metadata=include_drill_metadata,
+            overwrite=overwrite,
+        )
+
+    def write_white_image(
+        self,
+        output_path,
+        *,
+        galaxy,
+        bands=None,
+        overwrite=False,
+    ):
+        """Write an inverse-variance weighted image on the final pipeline grid."""
+        self._require_last_catalog()
+        return write_white_image(
+            self,
+            output_path,
+            galaxy=galaxy,
+            bands=bands,
             overwrite=overwrite,
         )
         
@@ -850,6 +1064,50 @@ class ImageQuery():
         if collisions:
             raise DuplicateImageError(collisions)
                     
+        return image_set
+
+    @classmethod
+    def querySpherexCube(
+        cls,
+        filepath,
+        galaxy_name=None,
+        channels=None,
+        *,
+        response_root=None,
+        strict_version=True,
+    ):
+        """Load one or more glob-matched SPHEREx cubes as 2-D bands."""
+        from .spherex_cube import SpherexMosaicImporter
+
+        literal_path = Path(filepath).expanduser()
+        if literal_path.is_file():
+            matched_paths = [literal_path]
+        else:
+            pattern = str(literal_path)
+            matched_paths = [
+                Path(path)
+                for path in sorted(glob(pattern, recursive=True))
+                if Path(path).is_file()
+            ]
+        if not matched_paths:
+            raise FileNotFoundError(
+                f"No SPHEREx mosaic matches input pattern: {filepath}"
+            )
+        if galaxy_name is not None and len(matched_paths) != 1:
+            raise ValueError(
+                "galaxy_name can only override a single SPHEREx cube; "
+                "omit it when loading a glob pattern with multiple matches"
+            )
+
+        importer = SpherexMosaicImporter(
+            response_root=response_root,
+            strict_version=strict_version,
+        )
+        image_set = GalaxyImageSet(auto_ensure_filters=False)
+        for path in matched_paths:
+            image_set.append(
+                importer.load(path, galaxy_name=galaxy_name, channels=channels)
+            )
         return image_set
 
     @classmethod

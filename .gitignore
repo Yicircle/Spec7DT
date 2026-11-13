@@ -7,7 +7,15 @@ __pycache__/
 
 # Test directories and files
 *test/*
-!test/test_registration.py
+# !test/test_registration.py
+# !test/test_spherex_cube.py
+# !test/test_background_auto.py
+# !test/validate_ngc1566_background.py
+# !test/validate_ngc1566_background.sh
+# !test/sed_drill.py
+# !test/test_sed_drill.py
+# !test/test_psf_safe.py
+# !test/test_spherex_mosaic_psf.py
 */*/temp/*
 
 # Distribution / packaging

@@ -26,6 +26,7 @@ from ..utils.utility import useful_functions
 from ..utils.reporting import emit_alert, emit_detail
 from ..handlers.filter_handler import Filters
 from ..utils.file_handler import Parsers
+from ..core import AnalysisProduct
 
 
 def _normalize_angular_fov(value):
@@ -277,6 +278,11 @@ class PointSpreadFunction:
             f"pixel_scale(ny,nx)={measurement_info['pixel_scale_arcsec']} arcsec/pixel, "
             f"prepare={measurement_info['prepare_seconds']:.3f}s, "
             f"method={method}, fwhm={fwhm_text} arcsec, measure={measurement_elapsed:.3f}s"
+        )
+        return AnalysisProduct(
+            kind="psf",
+            data={"fwhm_arcsec": fwhm_val},
+            metadata={"method": method, **measurement_info},
         )
 
     @classmethod

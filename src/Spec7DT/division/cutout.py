@@ -1,6 +1,7 @@
 import numpy as np
 
 from ..utils.utility import useful_functions
+from ..core import AnalysisProduct
 
 class CutRegion:
     
@@ -15,6 +16,11 @@ class CutRegion:
             box_size = (x, y, a, b, th)
             
         image_set.cutout_shape = (galaxy_name, observatory, band, box_size)
+        return AnalysisProduct(
+            kind="cutout_shape",
+            data={"x": box_size[0], "y": box_size[1], "a": box_size[2],
+                  "b": box_size[3], "theta": box_size[4]},
+        )
     
     @classmethod
     def cutout_region(cls, image_data, error_data, galaxy_name, observatory, band, image_set):

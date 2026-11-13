@@ -1,27 +1,32 @@
 import inspect
 from pathlib import Path
 from time import perf_counter
+from typing import Literal
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from ..plot.plot import DrawGalaxy
 from ..handlers.filter_handler import Filters
-from ..core import CatalogFrame
+from ..core import AnalysisProduct, CatalogFrame
+from .checkpoint import CheckpointManager
 from .metadata import GalaxyMetadataConfig, GalaxyMetadataResolver
-from .reporting import RichPipelineReporter, reporter_context
+from .reporting import RichPipelineReporter, pipeline_warning_context, reporter_context
 
 
 @dataclass(frozen=True)
 class PipelineOutputConfig:
     progress: bool = True
     show_alerts: bool = True
+    live_alerts: bool = True
     pdf_path: str | Path | None = None
     pdf_dpi: int = 300
     show_plots: bool | None = None
     overwrite: bool = False
+    save_checkpoints: bool = False
+    checkpoint_dir: str | Path | None = None
 
     @classmethod
     def from_value(cls, value=None):
@@ -44,6 +49,16 @@ class PipelineOutputConfig:
             raise TypeError("show_plots must be bool or None")
         if not isinstance(self.show_alerts, bool):
             raise TypeError("show_alerts must be bool")
+        if not isinstance(self.live_alerts, bool):
+            raise TypeError("live_alerts must be bool")
+        if not isinstance(self.save_checkpoints, bool):
+            raise TypeError("save_checkpoints must be bool")
+        if self.checkpoint_dir is not None and not isinstance(
+            self.checkpoint_dir, (str, Path)
+        ):
+            raise TypeError("checkpoint_dir must be a path-like string, Path, or None")
+        if self.checkpoint_dir is not None and not self.save_checkpoints:
+            raise ValueError("checkpoint_dir requires save_checkpoints=True")
 
     @property
     def resolved_show_plots(self):
@@ -60,28 +75,52 @@ class ImageProcessingPipeline:
         self.pipeline_steps = []
         self.step_configs = {}
     
-    def add_step(self, function, config=None, step_name=None):
+    def add_step(
+        self,
+        function,
+        config=None,
+        step_name=None,
+        *,
+        step_id=None,
+        mutates=(),
+        product_kind=None,
+    ):
         """파이프라인에 처리 단계 추가"""
         if step_name is None:
             step_name = function.__name__
         
         self.pipeline_steps.append({
+            'id': step_id or function.__name__,
             'name': step_name,
             'function': function,
             'config': config or {},
             'scope': 'image',
+            'mutates': tuple(mutates),
+            'product_kind': product_kind,
         })
 
-    def add_image_set_step(self, function, config=None, step_name=None):
+    def add_image_set_step(
+        self,
+        function,
+        config=None,
+        step_name=None,
+        *,
+        step_id=None,
+        mutates=(),
+        product_kind=None,
+    ):
         """Add a step that runs once against the complete GalaxyImageSet."""
         if step_name is None:
             step_name = function.__name__
 
         self.pipeline_steps.append({
+            'id': step_id or function.__name__,
             'name': step_name,
             'function': function,
             'config': config or {},
             'scope': 'image_set',
+            'mutates': tuple(mutates),
+            'product_kind': product_kind,
         })
         
     def remove_step(self, step_name):
@@ -98,9 +137,16 @@ class ImageProcessingPipeline:
         verbose=False,
         output_config=None,
         reporter=None,
+        checkpoint_manager=None,
+        completed_step_ids=None,
     ):
         """파이프라인 실행"""
         output_config = PipelineOutputConfig.from_value(output_config)
+        if checkpoint_manager is not None and any(
+            value is not None
+            for value in (galaxy_filter, observatory_filter, band_filter)
+        ):
+            raise ValueError("Checkpointed execution does not support target filters")
         if output_config.pdf_path is not None and not isinstance(plot_step, dict):
             raise ValueError("pdf_path requires plot_step to be a selector dictionary")
 
@@ -123,18 +169,26 @@ class ImageProcessingPipeline:
             progress=output_config.progress,
             verbose=verbose,
             show_alerts=output_config.show_alerts,
+            live_alerts=output_config.live_alerts,
         )
         timings = []
         active_step = None
         active_target = None
         succeeded = False
-        reporter.start(len(self.pipeline_steps))
+        completed_step_ids = set(completed_step_ids or ())
+        remaining_steps = [
+            step for step in self.pipeline_steps if step["id"] not in completed_step_ids
+        ]
+        reporter.start(len(remaining_steps))
 
-        with reporter_context(reporter):
+        with reporter_context(reporter), pipeline_warning_context(reporter):
             try:
-                for step in self.pipeline_steps:
+                for step_index, step in enumerate(self.pipeline_steps, start=1):
+                    if step["id"] in completed_step_ids:
+                        continue
                     active_step = step["name"]
                     active_target = None
+                    step_products = []
                     if step.get("scope") == "image_set":
                         total_targets = self._image_count()
                     else:
@@ -157,11 +211,13 @@ class ImageProcessingPipeline:
                         active_target = "GalaxyImageSet"
                         reporter.set_target(step["name"], active_target)
                         before = reporter.step_completed
-                        delegated_progress = self._execute_image_set_step(
+                        delegated_progress, product = self._execute_image_set_step(
                             step,
                             verbose,
                             reporter=reporter,
                         )
+                        if isinstance(product, AnalysisProduct):
+                            step_products.append({"product": product})
                         if not delegated_progress or reporter.step_completed == before:
                             reporter.advance_target(advance=total_targets)
                         processed_targets = total_targets
@@ -173,7 +229,7 @@ class ImageProcessingPipeline:
                         ):
                             active_target = f"{galaxy}/{observatory}/{band}"
                             reporter.set_target(step["name"], active_target)
-                            elapsed = self._execute_step(
+                            elapsed, product = self._execute_step(
                                 step,
                                 galaxy,
                                 observatory,
@@ -183,12 +239,26 @@ class ImageProcessingPipeline:
                                 error,
                                 verbose,
                             )
+                            if isinstance(product, AnalysisProduct):
+                                step_products.append({
+                                    "galaxy": galaxy,
+                                    "observatory": observatory,
+                                    "band": band,
+                                    "product": product,
+                                })
                             reporter.detail(
                                 f"✓ {step['name']} completed for {active_target} "
                                 f"in {elapsed:.3f}s"
                             )
                             reporter.advance_target()
                             processed_targets += 1
+
+                    if checkpoint_manager is not None:
+                        checkpoint_manager.complete_step(
+                            step_index,
+                            step,
+                            products=step_products,
+                        )
 
                     step_elapsed = perf_counter() - step_start
                     timings.append({
@@ -233,7 +303,10 @@ class ImageProcessingPipeline:
                 reporter.stop()
 
         if succeeded:
-            reporter.summary(timings, pdf_path=pdf_path)
+            summary_kwargs = {"pdf_path": pdf_path}
+            if checkpoint_manager is not None:
+                summary_kwargs["checkpoint_dirs"] = checkpoint_manager.output_dirs
+            reporter.summary(timings, **summary_kwargs)
         return self.galaxy_image_set
 
     def _image_count(self):
@@ -307,9 +380,15 @@ class ImageProcessingPipeline:
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
         
         target_start = perf_counter()
-        function(**filtered_kwargs)
+        result = function(**filtered_kwargs)
+        if (
+            result is not None
+            and step.get("product_kind")
+            and not isinstance(result, AnalysisProduct)
+        ):
+            result = AnalysisProduct(kind=step["product_kind"], data=result)
         elapsed = perf_counter() - target_start
-        return elapsed
+        return elapsed, result
 
     def _execute_image_set_step(self, step, verbose, reporter=None):
         """Execute a step once for the complete, unfiltered image set."""
@@ -326,13 +405,19 @@ class ImageProcessingPipeline:
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
 
         target_start = perf_counter()
-        function(**filtered_kwargs)
+        result = function(**filtered_kwargs)
+        if (
+            result is not None
+            and step.get("product_kind")
+            and not isinstance(result, AnalysisProduct)
+        ):
+            result = AnalysisProduct(kind=step["product_kind"], data=result)
         elapsed = perf_counter() - target_start
         if reporter is not None:
             reporter.detail(
                 f"✓ {step['name']} completed for GalaxyImageSet in {elapsed:.3f}s"
             )
-        return "reporter" in sig.parameters
+        return "reporter" in sig.parameters, result
 
 
 from ..reduction.registration import Register
@@ -342,12 +427,14 @@ from ..reduction.background import (
     backgroundSubtraction,
     estimateMissingError,
     has_missing_error_maps,
+    residualBackgroundSubtraction,
 )
 from ..reduction.PSF import (
     PSFConvolutionConfig,
     PSFConvolutionEngine,
     PointSpreadFunction,
 )
+from ..reduction.PSF_safe import SafePSFConfig, SafePointSpreadFunction
 from ..manipulation.reddening import Reddening
 from ..manipulation.mask import Masking
 from ..manipulation.sky_interpolate import interpolate_sky
@@ -389,8 +476,8 @@ class PipelineConfig:
 
 
 def execute_pipeline(
-    galaxy_image_set,
-    cat_type,
+    galaxy_image_set=None,
+    cat_type=None,
     processes=None,
     plot_step=False,
     verbose=False,
@@ -405,21 +492,181 @@ def execute_pipeline(
     metadata_config: GalaxyMetadataConfig | dict = None,
     filter_config: dict = None,
     psfconv_config: PSFConvolutionConfig | dict = None,
+    psf_strategy: Literal["safe", "legacy"] | None = None,
+    safe_psf_config: SafePSFConfig | dict | None = None,
     background_config: BackgroundConfig | dict = None,
     output_config: PipelineOutputConfig | dict = None,
+    resume_from: str | Path | None = None,
 ):
-    pipeline_config = PipelineConfig.from_processes(config if config is not None else processes)
-    psfconv_config = PSFConvolutionConfig.from_value(psfconv_config)
+    checkpoint_manager = None
+    completed_step_ids = ()
+    resume_settings = None
+    if resume_from is not None:
+        if galaxy_image_set is not None:
+            raise ValueError("galaxy_image_set and resume_from cannot be used together")
+        conflicting = []
+        for name, value, default in (
+            ("processes", processes, None),
+            ("trim_size", trim_size, None),
+            ("manual_mask", manual_mask, None),
+            ("gaia_mask", gaia_mask, None),
+            ("bin", bin, 1),
+            ("box_size", box_size, None),
+            ("cut_coeff", cut_coeff, 1.5),
+            ("config", config, None),
+            ("galaxy_metadata", galaxy_metadata, None),
+            ("metadata_config", metadata_config, None),
+            ("filter_config", filter_config, None),
+            ("psfconv_config", psfconv_config, None),
+            ("psf_strategy", psf_strategy, None),
+            ("safe_psf_config", safe_psf_config, None),
+            ("background_config", background_config, None),
+        ):
+            differs = value is not None if default is None else value != default
+            if differs:
+                conflicting.append(name)
+        if conflicting:
+            raise ValueError(
+                "Resume uses the science settings stored in the checkpoint; remove: "
+                + ", ".join(conflicting)
+            )
+
+        resumed = CheckpointManager.resume(resume_from)
+        galaxy_image_set = resumed.image_set
+        checkpoint_manager = resumed.manager
+        completed_step_ids = resumed.completed_step_ids
+        resume_settings = resumed.settings
+        stored_cat_type = resume_settings["cat_type"]
+        if cat_type is not None and cat_type != stored_cat_type:
+            raise ValueError(
+                f"cat_type {cat_type!r} does not match checkpoint value {stored_cat_type!r}"
+            )
+        cat_type = stored_cat_type
+
+        pipeline_values = dict(resume_settings["pipeline_config"])
+        pipeline_extras = dict(pipeline_values.pop("extras", {}))
+        pipeline_config = PipelineConfig(**pipeline_values, extras=pipeline_extras)
+        trim_size = resume_settings.get("trim_size")
+        manual_mask = resume_settings.get("manual_mask")
+        gaia_mask = resume_settings.get("gaia_mask")
+        bin = resume_settings.get("bin", 1)
+        box_size = resume_settings.get("box_size")
+        cut_coeff = resume_settings.get("cut_coeff", 1.5)
+        galaxy_metadata = resume_settings.get("galaxy_metadata")
+        metadata_config = resume_settings.get("metadata_config")
+        filter_config = resume_settings.get("filter_config")
+        psfconv_config = resume_settings.get("psfconv_config")
+        psf_strategy = resume_settings.get("psf_strategy", "legacy")
+        safe_psf_config = resume_settings.get("safe_psf_config")
+        background_config = resume_settings.get("background_config")
+    else:
+        if galaxy_image_set is None:
+            raise TypeError("galaxy_image_set is required unless resume_from is provided")
+        if cat_type is None:
+            raise TypeError("cat_type is required unless it is restored from a checkpoint")
+        pipeline_config = PipelineConfig.from_processes(
+            config if config is not None else processes
+        )
+
+    if resume_settings is not None and (
+        background_config is None
+        or (isinstance(background_config, dict) and "mode" not in background_config)
+    ):
+        # Manifests written before automatic background selection must retain
+        # their original step plan and native-background behavior.
+        background_config = {
+            **(background_config or {}),
+            "mode": "legacy",
+            "post_residual": False,
+        }
+
+    if psf_strategy is None:
+        psf_strategy = "legacy" if psfconv_config is not None else "safe"
+    psf_strategy = str(psf_strategy).lower()
+    if psf_strategy not in {"safe", "legacy"}:
+        raise ValueError("psf_strategy must be 'safe' or 'legacy'")
+    if psf_strategy == "safe" and psfconv_config is not None:
+        raise ValueError(
+            "psfconv_config belongs to the legacy PSF strategy; use safe_psf_config "
+            "or set psf_strategy='legacy'"
+        )
+    if psf_strategy == "legacy" and safe_psf_config is not None:
+        raise ValueError("safe_psf_config requires psf_strategy='safe'")
+    psfconv_config = (
+        PSFConvolutionConfig.from_value(psfconv_config)
+        if psf_strategy == "legacy"
+        else None
+    )
+    safe_psf_config = (
+        SafePSFConfig.from_value(safe_psf_config)
+        if psf_strategy == "safe"
+        else None
+    )
     background_config = BackgroundConfig.from_value(background_config)
     output_config = PipelineOutputConfig.from_value(output_config)
     if output_config.pdf_path is not None and not isinstance(plot_step, dict):
         raise ValueError("pdf_path requires plot_step to be a selector dictionary")
-    if not pipeline_config.enabled("psfconv") and psfconv_config.pretrim_fov is not None:
+    selected_pretrim_fov = (
+        safe_psf_config.pretrim_fov
+        if psf_strategy == "safe"
+        else psfconv_config.pretrim_fov
+    )
+    if not pipeline_config.enabled("psfconv") and selected_pretrim_fov is not None:
         raise ValueError("pretrim_fov requires the psfconv pipeline step to be enabled")
     manual_mask = Masking.prepare_manual_mask(manual_mask)
     if isinstance(metadata_config, dict):
         metadata_config = GalaxyMetadataConfig(**metadata_config)
     metadata_resolver = GalaxyMetadataResolver(metadata=galaxy_metadata, config=metadata_config)
+
+    if (
+        psf_strategy == "safe"
+        and pipeline_config.enabled("psf")
+        and safe_psf_config.mosaic_synthesis is not None
+        and "psf_extract" not in completed_step_ids
+    ):
+        from ..handlers.spherex_mosaic_psf import (
+            build_spherex_mosaic_psf_manifest,
+            merge_psf_manifests,
+            spherex_mosaic_synthesis_required,
+            synthesis_config_for_analysis_footprint,
+        )
+
+        synthesis_config = synthesis_config_for_analysis_footprint(
+            galaxy_image_set,
+            safe_psf_config.mosaic_synthesis,
+            pretrim_fov=safe_psf_config.pretrim_fov,
+            trim_size=trim_size if pipeline_config.enabled("trim") else None,
+            metadata_resolver=metadata_resolver,
+        )
+        synthesis_config = replace(
+            synthesis_config,
+            progress=bool(synthesis_config.progress and output_config.progress),
+        )
+        safe_psf_config = replace(
+            safe_psf_config,
+            mosaic_synthesis=synthesis_config,
+        )
+        if spherex_mosaic_synthesis_required(
+            galaxy_image_set,
+            safe_psf_config.psf_manifest,
+            synthesis_config.tile_bounds,
+        ):
+            build_result = build_spherex_mosaic_psf_manifest(
+                galaxy_image_set,
+                synthesis_config,
+                calibration_registry=safe_psf_config.calibration_registry,
+                existing_manifest=safe_psf_config.psf_manifest,
+            )
+            safe_psf_config = replace(
+                safe_psf_config,
+                psf_manifest=merge_psf_manifests(
+                    safe_psf_config.psf_manifest,
+                    build_result.manifest_path,
+                ),
+            )
+            builds = list(getattr(galaxy_image_set, "_spherex_psf_builds", ()))
+            builds.append(build_result)
+            galaxy_image_set._spherex_psf_builds = builds
 
     filter_options = {"allow_svo": True, "cache": True, "warn": True, "unknown_policy": "best_effort"}
     if filter_config:
@@ -428,7 +675,7 @@ def execute_pipeline(
     gaia_mask_enabled = pipeline_config.enabled("mask") and gaia_mask is not None and gaia_mask is not False
     if pipeline_config.enabled("dered") or pipeline_config.enabled("psf") or gaia_mask_enabled:
         Filters.ensure_filters_for_image_set(galaxy_image_set, **filter_options)
-    if gaia_mask_enabled:
+    if gaia_mask_enabled and not hasattr(galaxy_image_set, "_gaia_mask_reference_cache"):
         setattr(galaxy_image_set, "_gaia_mask_reference_cache", {})
     
     
@@ -442,68 +689,218 @@ def execute_pipeline(
         pipeline1.add_step(
             backgroundSubtraction,
             config={"background_config": background_config},
+            step_id="background",
+            mutates=(
+                ("data", "error")
+                if background_config.mode == "legacy"
+                else ("data", "error", "header")
+            ),
         )
     elif has_missing_error_maps(galaxy_image_set):
         pipeline1.add_step(
             estimateMissingError,
             config={"background_config": background_config},
             step_name="Estimate Missing Error",
+            step_id="estimate_error",
+            mutates=("error",),
         )
-    pipeline_config.enabled("psf") and pipeline1.add_step(
-        PointSpreadFunction.extract,
-        config={"psfconv_config": psfconv_config},
-        step_name="Extract PSF",
-    )
-    if pipeline_config.enabled("psfconv") and psfconv_config.pretrim_fov is not None:
-        pipeline1.add_step(
-            Register.pretrim_for_convolution,
-            config={
-                "pretrim_fov": psfconv_config.pretrim_fov,
-                "kernel_truncate": psfconv_config.kernel_truncate,
-            },
-            step_name="Pre-convolution Trim",
+    if pipeline_config.enabled("psf"):
+        if psf_strategy == "safe":
+            pipeline1.add_step(
+                SafePointSpreadFunction.extract,
+                config={"safe_psf_config": safe_psf_config},
+                step_name="Extract PSF",
+                step_id="psf_extract",
+                product_kind="psf",
+            )
+        else:
+            pipeline1.add_step(
+                PointSpreadFunction.extract,
+                config={"psfconv_config": psfconv_config},
+                step_name="Extract PSF",
+                step_id="psf_extract",
+                product_kind="psf",
+            )
+    if pipeline_config.enabled("psfconv") and psf_strategy == "safe":
+        pipeline1.add_image_set_step(
+            SafePointSpreadFunction.prepare,
+            config={"safe_psf_config": safe_psf_config},
+            step_name="Prepare Safe PSF Kernels",
+            step_id="psf_prepare",
+            product_kind="psf_match",
         )
+    if pipeline_config.enabled("psfconv") and selected_pretrim_fov is not None:
+        if psf_strategy == "safe":
+            pipeline1.add_step(
+                SafePointSpreadFunction.pretrim,
+                config={"safe_psf_config": safe_psf_config},
+                step_name="Pre-convolution Trim",
+                step_id="psf_pretrim",
+                mutates=("data", "header", "error"),
+            )
+        else:
+            pipeline1.add_step(
+                Register.pretrim_for_convolution,
+                config={
+                    "pretrim_fov": psfconv_config.pretrim_fov,
+                    "kernel_truncate": psfconv_config.kernel_truncate,
+                },
+                step_name="Pre-convolution Trim",
+                step_id="psf_pretrim",
+                mutates=("data", "header", "error"),
+            )
     gaia_mask_enabled and pipeline1.add_step(
         Masking.prepare_gaia_reference,
         config={"gaia_mask": gaia_mask},
         step_name="Prepare GAIA Mask Reference",
+        step_id="gaia_reference",
+        product_kind="gaia_reference",
     )
     if pipeline_config.enabled("psfconv"):
-        convolution_engine = PSFConvolutionEngine(psfconv_config)
-        pipeline1.add_step(
-            PointSpreadFunction.convolution,
-            config={
-                "convolution_engine": convolution_engine,
-                "psfconv_config": psfconv_config,
-            },
-            step_name="Convolve with PSF",
-        )
+        if psf_strategy == "safe":
+            convolution_engine = PSFConvolutionEngine(safe_psf_config.convolution_config())
+            pipeline1.add_step(
+                SafePointSpreadFunction.convolution,
+                config={
+                    "convolution_engine": convolution_engine,
+                    "safe_psf_config": safe_psf_config,
+                },
+                step_name="Convolve with PSF",
+                step_id="psf_convolve",
+                mutates=("data", "header", "error"),
+            )
+        else:
+            convolution_engine = PSFConvolutionEngine(psfconv_config)
+            pipeline1.add_step(
+                PointSpreadFunction.convolution,
+                config={
+                    "convolution_engine": convolution_engine,
+                    "psfconv_config": psfconv_config,
+                },
+                step_name="Convolve with PSF",
+                step_id="psf_convolve",
+                mutates=("data", "error"),
+            )
 
     
     pipeline_config.enabled("register") and pipeline1.add_image_set_step(
         Register.register_image_set,
         step_name="SWarp Registration",
+        step_id="register",
+        mutates=("data", "header", "error"),
     )
-    pipeline_config.enabled("trim") and pipeline1.add_step(Register().trim, config={"trim_size" : trim_size}, step_name="Trimming")
+    pipeline_config.enabled("trim") and pipeline1.add_step(
+        Register().trim,
+        config={"trim_size": trim_size},
+        step_name="Trimming",
+        step_id="trim",
+        mutates=("data", "header", "error"),
+    )
     pipeline_config.enabled("mask") and pipeline1.add_step(
         Masking.adapt_mask,
         config={"manual": manual_mask, "gaia_mask": gaia_mask},
         step_name="Masking",
+        step_id="mask",
+        mutates=("data", "error"),
     )
-    pipeline_config.enabled("skyinter") and pipeline1.add_step(interpolate_sky, step_name="Interpolate Masked Region")
-    pipeline_config.enabled("unit") and pipeline1.add_step(conversion().unitConvertor, step_name="Convert Unit")
+    pipeline_config.enabled("skyinter") and pipeline1.add_step(
+        interpolate_sky,
+        step_name="Interpolate Masked Region",
+        step_id="sky_interpolate",
+        mutates=("data",),
+    )
+    pipeline_config.enabled("unit") and pipeline1.add_step(
+        conversion().unitConvertor,
+        step_name="Convert Unit",
+        step_id="unit_convert",
+        mutates=("data", "error", "header"),
+    )
     
-    pipeline_config.enabled("dered") and pipeline1.add_step(Reddening().dered, step_name="Dereddening")
-    pipeline_config.enabled("bin") and pipeline1.add_step(Bin.do_binning, config={"bin_size": int(bin)}, step_name="Binning Image")
+    pipeline_config.enabled("dered") and pipeline1.add_step(
+        Reddening().dered,
+        step_name="Dereddening",
+        step_id="deredden",
+        mutates=("data", "error"),
+    )
+    pipeline_config.enabled("bin") and pipeline1.add_step(
+        Bin.do_binning,
+        config={"bin_size": int(bin)},
+        step_name="Binning Image",
+        step_id="bin",
+        mutates=("data", "error", "header"),
+    )
     
-    pipeline_config.enabled("cutout") and pipeline1.add_step(CutRegion.get_shape, config={"box_size" : box_size, "cut_coeff": cut_coeff}, step_name="Get Cutout Region")
+    pipeline_config.enabled("cutout") and pipeline1.add_step(
+        CutRegion.get_shape,
+        config={"box_size": box_size, "cut_coeff": cut_coeff},
+        step_name="Get Cutout Region",
+        step_id="cutout_measure",
+        product_kind="cutout_shape",
+    )
+
+    if (
+        pipeline_config.enabled("background")
+        and pipeline_config.enabled("cutout")
+        and background_config.post_residual
+        and background_config.mode != "legacy"
+    ):
+        pipeline1.add_image_set_step(
+            residualBackgroundSubtraction,
+            config={"background_config": background_config},
+            step_name="Residual Background",
+            step_id="residual_background",
+            mutates=("data", "header"),
+            product_kind="residual_background",
+        )
     
-    pipeline_config.enabled("cutout") and pipeline1.add_step(CutRegion.cutout_region, step_name="Cutout Image")
+    pipeline_config.enabled("cutout") and pipeline1.add_step(
+        CutRegion.cutout_region,
+        step_name="Cutout Image",
+        step_id="cutout_apply",
+        mutates=("data", "error"),
+    )
+
+    if checkpoint_manager is not None:
+        if output_config.checkpoint_dir is not None:
+            raise ValueError("checkpoint_dir cannot be changed while resuming a run")
+        checkpoint_manager.validate_step_plan(pipeline1.pipeline_steps)
+    elif output_config.save_checkpoints:
+        science_settings = {
+            "cat_type": cat_type,
+            "pipeline_config": asdict(pipeline_config),
+            "trim_size": trim_size,
+            "manual_mask": manual_mask,
+            "gaia_mask": gaia_mask,
+            "bin": int(bin),
+            "box_size": box_size,
+            "cut_coeff": cut_coeff,
+            "galaxy_metadata": galaxy_metadata,
+            "metadata_config": (
+                asdict(metadata_config) if metadata_config is not None else None
+            ),
+            "filter_config": filter_config,
+            "psf_strategy": psf_strategy,
+            "psfconv_config": (
+                asdict(psfconv_config) if psfconv_config is not None else None
+            ),
+            "safe_psf_config": (
+                asdict(safe_psf_config) if safe_psf_config is not None else None
+            ),
+            "background_config": asdict(background_config),
+        }
+        checkpoint_manager = CheckpointManager.create(
+            galaxy_image_set,
+            settings=science_settings,
+            step_plan=CheckpointManager.step_plan(pipeline1.pipeline_steps),
+            checkpoint_dir=output_config.checkpoint_dir,
+        )
     
     galaxy_image_set = pipeline1.execute(
         plot_step=plot_step,
         verbose=verbose,
         output_config=output_config,
+        checkpoint_manager=checkpoint_manager,
+        completed_step_ids=completed_step_ids,
     )
     
     input_df = inputGenerator.dataframe_generator(
@@ -519,4 +916,12 @@ def execute_pipeline(
             catalog_type=cat_type,
             units={"flux": flux_unit, "error": flux_unit},
         ))
+    if input_df is not None and checkpoint_manager is not None:
+        input_df.attrs["spec7dt_run_id"] = next(
+            iter(checkpoint_manager.manifests.values())
+        )["run_id"]
+        input_df.attrs["spec7dt_checkpoint_dirs"] = {
+            galaxy: str(path)
+            for galaxy, path in checkpoint_manager.output_dirs.items()
+        }
     return input_df
