@@ -2,6 +2,9 @@ import numpy as np
 import warnings
 from .utility import Observatories, useful_functions
 
+# Error assigned to pixels without a valid measurement (same as the Gaia-mask fill).
+INVALID_ERROR_FILL = 999.0
+
 class conversion:
     def __init__(self):
         self.obs_match = {'GALEX': self.GALEX,
@@ -74,7 +77,12 @@ class conversion:
         try:
             # All functions now have standardized signature
             convert_im, convert_err = conversion_func(image_data, header, band), conversion_func(error_data, header, band)
+            # Pixels without a valid measurement keep zero flux but receive the
+            # invalid-error fill value (the Gaia-mask convention), so a bin that
+            # touches one can never report a small error.
+            invalid = ~np.isfinite(convert_im) | ~np.isfinite(convert_err)
             convert_im = np.nan_to_num(convert_im, nan=0.0)
+            convert_err = np.where(invalid, INVALID_ERROR_FILL, convert_err)
             
             image_set.update_data(convert_im.astype(np.float32), galaxy_name, observatory, band)
             image_set.update_error(convert_err.astype(np.float32), galaxy_name, observatory, band)

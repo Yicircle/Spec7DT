@@ -1075,8 +1075,15 @@ class ImageQuery():
         *,
         response_root=None,
         strict_version=True,
+        drop_flagged_planes=True,
+        psf_mismatch_policy="keep",
     ):
-        """Load one or more glob-matched SPHEREx cubes as 2-D bands."""
+        """Load one or more glob-matched SPHEREx cubes as 2-D bands.
+
+        ``drop_flagged_planes`` and ``psf_mismatch_policy`` apply only to
+        PSF-homogenized (``PSFMODE='CUBE-COMMON'``) cubes; see
+        :meth:`SpherexMosaicImporter.load`.
+        """
         from .spherex_cube import SpherexMosaicImporter
 
         literal_path = Path(filepath).expanduser()
@@ -1104,10 +1111,23 @@ class ImageQuery():
             strict_version=strict_version,
         )
         image_set = GalaxyImageSet(auto_ensure_filters=False)
+        dropped_planes = None
         for path in matched_paths:
-            image_set.append(
-                importer.load(path, galaxy_name=galaxy_name, channels=channels)
+            loaded = importer.load(
+                path,
+                galaxy_name=galaxy_name,
+                channels=channels,
+                drop_flagged_planes=drop_flagged_planes,
+                psf_mismatch_policy=psf_mismatch_policy,
             )
+            loaded_dropped = getattr(loaded, "_spherex_dropped_planes", None)
+            if loaded_dropped is not None:
+                dropped_planes = {} if dropped_planes is None else dropped_planes
+                for galaxy, items in loaded_dropped.items():
+                    dropped_planes.setdefault(galaxy, []).extend(items)
+            image_set.append(loaded)
+        if dropped_planes is not None:
+            image_set._spherex_dropped_planes = dropped_planes
         return image_set
 
     @classmethod

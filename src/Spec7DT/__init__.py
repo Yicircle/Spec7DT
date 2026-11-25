@@ -13,5 +13,5 @@ from .handlers.spherex_mosaic_psf import (
     build_spherex_mosaic_psf_manifest,
 )
 
-Version = "0.15.0"
-version = Version
+version = "0.16.0"
+Version = version

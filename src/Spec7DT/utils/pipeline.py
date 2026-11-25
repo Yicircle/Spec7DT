@@ -692,7 +692,7 @@ def execute_pipeline(
             step_id="background",
             mutates=(
                 ("data", "error")
-                if background_config.mode == "legacy"
+                if background_config.legacy_only
                 else ("data", "error", "header")
             ),
         )
@@ -842,7 +842,7 @@ def execute_pipeline(
         pipeline_config.enabled("background")
         and pipeline_config.enabled("cutout")
         and background_config.post_residual
-        and background_config.mode != "legacy"
+        and not background_config.legacy_only
     ):
         pipeline1.add_image_set_step(
             residualBackgroundSubtraction,

@@ -18,8 +18,9 @@ from astropy import units as u
 from astropy.io import fits
 from astropy.nddata.utils import NoOverlapError
 from astropy.stats import sigma_clipped_stats
-from scipy.ndimage import affine_transform, gaussian_filter, laplace, shift
+from scipy.ndimage import affine_transform, gaussian_filter, laplace, map_coordinates, shift
 from scipy.fft import irfft2, next_fast_len, rfft2
+from scipy.signal import fftconvolve
 from scipy.optimize import least_squares, lsq_linear
 from scipy.sparse.linalg import LinearOperator
 
@@ -100,6 +101,11 @@ class SafePSFConfig:
     gpu_fallback: Literal["cpu", "error"] = "cpu"
     kernel_regularization: tuple[float, ...] = (1e-2, 1e-4, 1e-6)
     max_kernel_size: int = 63
+    # When the matching kernel needs more than ``max_kernel_size`` native pixels
+    # (e.g. 0.5"/px images matched to a ~17" PSF), "auto" solves it on an
+    # odd-integer binned grid, interpolates it back, and re-checks every QC
+    # metric on the native grid.  "off" fails immediately instead.
+    kernel_solve_binning: Literal["auto", "off"] = "auto"
     max_target_trials: int = 12
     target_bisection_steps: int = 5
     kernel_sum_tolerance: float = 1e-6
@@ -130,6 +136,8 @@ class SafePSFConfig:
             raise ValueError("level2_stamp_size must be an odd integer >= 3")
         if self.max_kernel_size < 3 or self.max_kernel_size % 2 == 0:
             raise ValueError("max_kernel_size must be an odd integer >= 3")
+        if self.kernel_solve_binning not in {"auto", "off"}:
+            raise ValueError("kernel_solve_binning must be 'auto' or 'off'")
         if self.max_target_trials < 1:
             raise ValueError("max_target_trials must be positive")
         if self.target_bisection_steps < 0:
@@ -200,6 +208,10 @@ class PSFMatchError(RuntimeError):
         lines = ["Safe PSF matching failed; no legacy fallback was applied:"]
         lines.extend(f"  {key}: {value}" for key, value in sorted(self.failures.items()))
         super().__init__("\n".join(lines))
+
+
+class KernelSizeError(RuntimeError):
+    """The matching kernel cannot fit the allowed size; widening the target cannot help."""
 
 
 def _validate_psf(
@@ -358,6 +370,138 @@ def _passes_qc(metrics, config):
         and metrics["kernel_edge_mass"] < config.kernel_edge_tolerance
         and metrics["ee_max_error"] < config.encircled_energy_tolerance
         and metrics["l1_error"] < config.l1_tolerance
+    )
+
+
+def _required_kernel_size(variance_source, variance_target):
+    """Odd kernel size covering +-4 sigma of the Gaussian-equivalent matching kernel."""
+    sigma = np.sqrt(max(float(variance_target) - float(variance_source), 0.25))
+    return max(3, int(2 * np.ceil(4.0 * sigma) + 1))
+
+
+def _bin_psf_centered(array, factor):
+    """Sum an odd-sized PSF into odd ``factor`` x ``factor`` blocks around its centre."""
+    array = np.asarray(array, dtype=float)
+    sizes = []
+    pads = []
+    for length in array.shape:
+        blocks = -(-length // factor)
+        blocks += 1 - blocks % 2
+        total = factor * blocks - length
+        sizes.append(blocks)
+        pads.append((total // 2, total - total // 2))
+    padded = np.pad(array, pads)
+    return padded.reshape(sizes[0], factor, sizes[1], factor).sum(axis=(1, 3))
+
+
+def _upsample_kernel(kernel, factor):
+    """Linearly interpolate a binned-grid kernel back onto the native grid."""
+    kernel = np.asarray(kernel, dtype=float)
+    shape = (factor * kernel.shape[0], factor * kernel.shape[1])
+    y = (np.arange(shape[0]) - (shape[0] - 1) / 2.0) / factor + (kernel.shape[0] - 1) / 2.0
+    x = (np.arange(shape[1]) - (shape[1] - 1) / 2.0) / factor + (kernel.shape[1] - 1) / 2.0
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    result = map_coordinates(
+        kernel, (yy, xx), order=1, mode="constant", cval=0.0, prefilter=False
+    )
+    result = np.maximum(result, 0.0)
+    total = float(np.sum(result, dtype=np.float64))
+    if not np.isfinite(total) or total <= 0:
+        raise RuntimeError("binned kernel interpolation produced no positive flux")
+    return result / total
+
+
+def _worst_metrics(per_sample):
+    metrics = dict(per_sample[int(np.argmax([item["l1_error"] for item in per_sample]))])
+    metrics["l1_error"] = max(item["l1_error"] for item in per_sample)
+    metrics["ee_max_error"] = max(item["ee_max_error"] for item in per_sample)
+    metrics["kernel_min"] = min(item["kernel_min"] for item in per_sample)
+    metrics["kernel_sum_error"] = max(item["kernel_sum_error"] for item in per_sample)
+    metrics["kernel_centroid"] = max(item["kernel_centroid"] for item in per_sample)
+    metrics["kernel_edge_mass"] = max(item["kernel_edge_mass"] for item in per_sample)
+    return metrics
+
+
+def _binned_kernel_match(sources, targets, weights, required_size, max_size, config):
+    """Solve an oversized matching kernel on a binned grid and verify it natively.
+
+    Returns ``(kernel, matched_mean, target_mean, metrics)`` on the native grid.
+    Raises :class:`KernelSizeError` when no binned solve can fit the kernel.
+    """
+    if config.kernel_solve_binning == "off":
+        raise KernelSizeError(
+            f"matching kernel needs about {required_size} px but max_kernel_size is "
+            f"{max_size} px and kernel_solve_binning='off'"
+        )
+    factor = int(np.ceil(required_size / max_size))
+    factor += 1 - factor % 2
+    coarse_sources = [_bin_psf_centered(item, factor) for item in sources]
+    coarse_targets = [_bin_psf_centered(item, factor) for item in targets]
+    coarse_sources = [item / np.sum(item, dtype=np.float64) for item in coarse_sources]
+    coarse_targets = [item / np.sum(item, dtype=np.float64) for item in coarse_targets]
+    coarse_required = int(np.ceil(required_size / factor))
+    coarse_required += 1 - coarse_required % 2
+    coarse_max = min(config.max_kernel_size, min(coarse_sources[0].shape))
+    coarse_max -= 1 - coarse_max % 2
+    if coarse_required > coarse_max:
+        raise KernelSizeError(
+            f"matching kernel needs about {required_size} px and does not fit "
+            f"max_kernel_size={config.max_kernel_size} even on a {factor}x binned grid; "
+            "check the input PSFs or reduce the resolution mismatch"
+        )
+    weights = np.asarray(weights, dtype=float)
+    weights = weights / np.sum(weights)
+    best = None
+    for size in range(coarse_required, coarse_max + 1, 4):
+        for regularization in config.kernel_regularization:
+            if len(coarse_sources) == 1:
+                coarse_kernel, coarse_matched = _solve_kernel(
+                    coarse_sources[0], coarse_targets[0], size, regularization
+                )
+                coarse_matched = [coarse_matched]
+            else:
+                coarse_kernel, coarse_matched = _solve_kernel_ensemble(
+                    coarse_sources, coarse_targets, weights, size, regularization
+                )
+            coarse_metrics = _worst_metrics([
+                _kernel_metrics(coarse_kernel, matched, target)
+                for matched, target in zip(coarse_matched, coarse_targets)
+            ])
+            if not _passes_qc(coarse_metrics, config):
+                if best is None or coarse_metrics["l1_error"] < best[3]["l1_error"]:
+                    coarse_metrics.update({"solve_binning": float(factor), "kernel_size": float(size)})
+                    best = (None, None, None, coarse_metrics)
+                continue
+            kernel = _upsample_kernel(coarse_kernel, factor)
+            matched_items = []
+            for source in sources:
+                matched = np.maximum(fftconvolve(source, kernel, mode="same"), 0.0)
+                matched_items.append(matched / np.sum(matched, dtype=np.float64))
+            metrics = _worst_metrics([
+                _kernel_metrics(kernel, matched, target)
+                for matched, target in zip(matched_items, targets)
+            ])
+            metrics.update({
+                "regularization": float(regularization),
+                "kernel_size": float(kernel.shape[0]),
+                "solve_binning": float(factor),
+                "binned_kernel_size": float(size),
+                "ensemble_size": float(len(sources)),
+            })
+            matched_mean = sum(weight * item for weight, item in zip(weights, matched_items))
+            target_mean = sum(weight * item for weight, item in zip(weights, targets))
+            candidate = (kernel.astype(np.float32), matched_mean, target_mean, metrics)
+            if _passes_qc(metrics, config):
+                return candidate
+            if best is None or metrics["l1_error"] < best[3]["l1_error"]:
+                best = candidate
+    raise RuntimeError(
+        f"positive kernel solved on a {factor}x binned grid did not pass native QC: "
+        + ", ".join(
+            f"{key}={value:.4g}"
+            for key, value in best[3].items()
+            if isinstance(value, (int, float, np.number))
+        )
     )
 
 
@@ -964,11 +1108,13 @@ class SafePointSpreadFunction:
 
         variance_source = np.sum(np.square(_centered_coordinates(source.shape)[0]) * source)
         variance_target = np.sum(np.square(_centered_coordinates(target.shape)[0]) * target)
-        sigma_guess = np.sqrt(max(variance_target - variance_source, 0.25))
-        initial_size = max(3, int(2 * np.ceil(4.0 * sigma_guess) + 1))
+        required_size = _required_kernel_size(variance_source, variance_target)
+        initial_size = required_size
         max_size = min(config.max_kernel_size, min(source.shape))
         if max_size % 2 == 0:
             max_size -= 1
+        if required_size > max_size:
+            return _binned_kernel_match([source], [target], [1.0], required_size, max_size, config)
         initial_size = min(initial_size, max_size)
         if initial_size % 2 == 0:
             initial_size += 1
@@ -1071,11 +1217,17 @@ class SafePointSpreadFunction:
         source_mean = sum(weight * item for weight, item in zip(weights, sources))
         variance_source = np.sum(np.square(_centered_coordinates(shape)[0]) * source_mean)
         variance_target = np.sum(np.square(_centered_coordinates(shape)[0]) * targets[0])
-        sigma_guess = np.sqrt(max(variance_target - variance_source, 0.25))
-        initial_size = max(3, int(2 * np.ceil(4.0 * sigma_guess) + 1))
+        required_size = _required_kernel_size(variance_source, variance_target)
+        initial_size = required_size
         max_size = min(config.max_kernel_size, min(shape))
         if max_size % 2 == 0:
             max_size -= 1
+        if required_size > max_size:
+            kernel, matched_mean, target_mean, metrics = _binned_kernel_match(
+                sources, targets, weights, required_size, max_size, config
+            )
+            metrics["ensemble_samples"] = float(original_ensemble_size)
+            return kernel, matched_mean, target_mean, metrics
         initial_size = min(initial_size, max_size)
         if initial_size % 2 == 0:
             initial_size += 1
@@ -1209,6 +1361,7 @@ class SafePointSpreadFunction:
         )
         results = {}
         failures = {}
+        structural = set()
         ensemble_tree = cls._ensemble_tree(image_set).get(galaxy, {})
         for observatory, bands in models.items():
             for band, model in bands.items():
@@ -1263,9 +1416,12 @@ class SafePointSpreadFunction:
                         matched_psf=np.asarray(matched, dtype=np.float32),
                         metrics=metrics,
                     )
+                except KernelSizeError as exc:
+                    failures[key] = str(exc)
+                    structural.add(key)
                 except Exception as exc:
                     failures[key] = str(exc)
-        return results, failures
+        return results, failures, structural
 
     @classmethod
     def prepare(cls, image_set, safe_psf_config=None, **_):
@@ -1328,7 +1484,7 @@ class SafePointSpreadFunction:
             trial_failures = None
             for trial in range(config.max_target_trials):
                 sigma = 0.0 if trial == 0 else base.fwhm_arcsec * 0.05 * 1.5 ** (trial - 1)
-                results, current_failures = cls._attempt_target(
+                results, current_failures, structural = cls._attempt_target(
                     image_set, galaxy, models, base, base_ensemble, sigma, config
                 )
                 if not current_failures:
@@ -1337,6 +1493,9 @@ class SafePointSpreadFunction:
                     break
                 last_failure_sigma = sigma
                 trial_failures = current_failures
+                if structural:
+                    # A wider target needs an even larger kernel; retrying cannot help.
+                    break
             if success_results is None:
                 failures.update(trial_failures or {galaxy: "target search failed"})
                 continue
@@ -1344,7 +1503,7 @@ class SafePointSpreadFunction:
                 low, high = last_failure_sigma, success_sigma
                 for _ in range(config.target_bisection_steps):
                     middle = 0.5 * (low + high)
-                    results, current_failures = cls._attempt_target(
+                    results, current_failures, _ = cls._attempt_target(
                         image_set, galaxy, models, base, base_ensemble, middle, config
                     )
                     if current_failures:
@@ -1365,9 +1524,11 @@ class SafePointSpreadFunction:
         for galaxy, observatories in prepared.items():
             for observatory, bands in observatories.items():
                 for band, result in bands.items():
+                    binning = result.metrics.get("solve_binning")
                     emit_detail(
                         f"Safe PSF kernel {galaxy}/{observatory}/{band}: shape={result.kernel.shape}, "
-                        f"target={result.target_psf.fwhm_arcsec:.6g} arcsec, "
+                        + (f"solved on {int(binning)}x binned grid, " if binning else "")
+                        + f"target={result.target_psf.fwhm_arcsec:.6g} arcsec, "
                         f"L1={result.metrics['l1_error']:.4g}, EE={result.metrics['ee_max_error']:.4g}"
                     )
         return AnalysisProduct(kind="psf_match", data=summaries, metadata={"strategy": "safe"})
@@ -1462,6 +1623,14 @@ class SafePointSpreadFunction:
             uncertainty = np.sqrt(np.maximum(convolved_variance, 0.0)).astype(np.float32)
             uncertainty[support < 1.0 - config.support_tolerance] = np.nan
         updated_header = header.copy()
+        if kernel.shape != (1, 1):
+            from ..division.binning import strip_noise_correlation
+
+            strip_noise_correlation(
+                updated_header,
+                f"{galaxy_name}/{observatory}/{band}",
+                "the image was convolved with a non-delta PSF-matching kernel",
+            )
         updated_header["PSFMODE"] = ("SAFE", "Spec7DT PSF matching strategy")
         updated_header["PSFIN"] = (result.input_psf.fwhm_arcsec, "Input PSF FWHM [arcsec]")
         updated_header["PSFOUT"] = (result.target_psf.fwhm_arcsec, "Matched PSF FWHM [arcsec]")

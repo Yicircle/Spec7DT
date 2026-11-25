@@ -1,6 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from time import perf_counter
-from typing import Literal
+from typing import Literal, Mapping
 import warnings
 
 import numpy as np
@@ -38,6 +38,9 @@ class BackgroundConfig:
     fallback: Literal["global_rms", "error"] = "global_rms"
     mode: Literal["auto", "constant", "legacy"] = "auto"
     post_residual: bool = True
+    # Per-observatory override of ``mode``, e.g. {"SPHEREx": "constant"} for
+    # zodi-subtracted cubes that need only a constant residual offset removed.
+    mode_by_observatory: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_value(cls, value=None):
@@ -58,6 +61,46 @@ class BackgroundConfig:
             raise ValueError("mode must be 'auto', 'constant', or 'legacy'")
         if not isinstance(self.post_residual, bool):
             raise TypeError("post_residual must be bool")
+        overrides = self.mode_by_observatory
+        if overrides is None:
+            overrides = {}
+        if not isinstance(overrides, Mapping):
+            raise TypeError("mode_by_observatory must be a mapping of observatory to mode")
+        normalized = {}
+        for observatory, mode in overrides.items():
+            if mode not in {"auto", "constant", "legacy"}:
+                raise ValueError(
+                    f"mode_by_observatory[{observatory!r}] must be 'auto', 'constant', or 'legacy'"
+                )
+            key = str(observatory).strip().casefold()
+            if key in normalized and normalized[key][1] != mode:
+                raise ValueError(f"mode_by_observatory has conflicting entries for {observatory!r}")
+            normalized[key] = (str(observatory), mode)
+        object.__setattr__(
+            self,
+            "mode_by_observatory",
+            {name: mode for name, mode in normalized.values()},
+        )
+
+    def mode_for(self, observatory):
+        """Return the background mode for one observatory."""
+        key = str(observatory).strip().casefold()
+        for name, mode in self.mode_by_observatory.items():
+            if name.strip().casefold() == key:
+                return mode
+        return self.mode
+
+    @property
+    def legacy_only(self):
+        """True when every observatory uses the legacy background mode."""
+        return self.mode == "legacy" and all(
+            mode == "legacy" for mode in self.mode_by_observatory.values()
+        )
+
+    def for_observatory(self, observatory):
+        """Return this configuration with ``mode`` resolved for one observatory."""
+        mode = self.mode_for(observatory)
+        return self if mode == self.mode else replace(self, mode=mode)
 
 
 class _BackgroundEstimate:
@@ -882,7 +925,7 @@ def estimateMissingError(
     if _error_source(image_set, error_data, galaxy_name, observatory, band) != "missing":
         return
 
-    config = BackgroundConfig.from_value(background_config)
+    config = BackgroundConfig.from_value(background_config).for_observatory(observatory)
     target = _target_path(image_set, galaxy_name, observatory, band)
     coverage_mask = _coverage_mask(image_data)
     model_start = perf_counter()
@@ -930,7 +973,7 @@ def backgroundSubtraction(
     background_config=None,
 ):
     """Subtract an automatically selected source-masked background model."""
-    config = BackgroundConfig.from_value(background_config)
+    config = BackgroundConfig.from_value(background_config).for_observatory(observatory)
     target = _target_path(image_set, galaxy_name, observatory, band)
     coverage_mask = _coverage_mask(image_data)
 
@@ -1012,7 +1055,7 @@ def _ellipse_mask(shape, geometry, scale=1.0):
 def residualBackgroundSubtraction(image_set, background_config=None):
     """Remove a constant or plane residual outside the common target aperture."""
     config = BackgroundConfig.from_value(background_config)
-    if config.mode == "legacy" or not config.post_residual:
+    if config.legacy_only or not config.post_residual:
         return AnalysisProduct(kind="residual_background", data={})
 
     all_diagnostics = {}
@@ -1050,6 +1093,9 @@ def residualBackgroundSubtraction(image_set, background_config=None):
         common_geometry = np.nanmedian(np.vstack(valid_geometries), axis=0)
 
         for observatory, bands in observatories.items():
+            observatory_mode = config.mode_for(observatory)
+            if observatory_mode == "legacy":
+                continue
             for band, image_data in bands.items():
                 target = _target_name(galaxy, observatory, band)
                 image = np.asarray(image_data)
@@ -1099,7 +1145,7 @@ def residualBackgroundSubtraction(image_set, background_config=None):
                     **constant_metrics,
                 }
 
-                if config.mode == "auto" and sky_fraction >= _MIN_SKY_FRACTION:
+                if observatory_mode == "auto" and sky_fraction >= _MIN_SKY_FRACTION:
                     try:
                         plane, coefficients = _fit_plane(image, sky_valid)
                         plane_metrics = _validation_metrics(

@@ -1464,6 +1464,9 @@ def _group_products(image_set):
                     str(product.facility or observatory).lower() != "spherex"
                     or product.product_kind != "coadd"
                     or not product.requires_output_effective_psf
+                    # PSF-homogenized cubes already carry their output PSF;
+                    # synthesizing from INPUTS would give the pre-matching PSF.
+                    or dict(product.provenance or {}).get("psf_homogenized")
                 ):
                     continue
                 group_id = product.product_group_id or _stable_digest({

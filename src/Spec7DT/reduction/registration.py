@@ -480,6 +480,7 @@ class Register:
     ) -> None:
         for registered in registered_targets:
             target = registered.target
+            Register._audit_unresampled(image_set, registered)
             image_set.update_data(
                 registered.data,
                 target.galaxy,
@@ -503,6 +504,95 @@ class Register:
                 reporter.advance_target(
                     f"{target.galaxy}/{target.observatory}/{target.band}"
                 )
+
+    @staticmethod
+    def _audit_unresampled(image_set, registered) -> None:
+        """Warn when a product that must keep its native grid was resampled.
+
+        Products opt in with ``provenance['registration_check'] == 'unresampled'``
+        (for example PSF-homogenized cubes, whose PSF and noise correlation are
+        only valid on the imported pixel grid).
+        """
+        target = registered.target
+        product = (
+            getattr(image_set, "product_metadata", {})
+            .get(target.galaxy, {})
+            .get(target.observatory, {})
+            .get(target.band)
+        )
+        if product is None:
+            return
+        provenance = getattr(product, "provenance", None)
+        if provenance is None and isinstance(product, dict):
+            provenance = product.get("provenance")
+        if dict(provenance or {}).get("registration_check") != "unresampled":
+            return
+        label = f"{target.galaxy}/{target.observatory}/{target.band}"
+        reg = np.asarray(registered.data)
+        orig = np.asarray(target.data)
+        try:
+            original_wcs = WCS(target.header, relax=True).celestial
+            output_wcs = WCS(registered.header, relax=True).celestial
+            ny, nx = reg.shape
+            probe = np.array(
+                [[0, 0], [nx - 1, 0], [0, ny - 1], [nx - 1, ny - 1], [(nx - 1) / 2, (ny - 1) / 2]],
+                dtype=float,
+            )
+            world = output_wcs.pixel_to_world_values(probe[:, 0], probe[:, 1])
+            original_x, original_y = original_wcs.world_to_pixel_values(*world)
+            offsets = np.column_stack((original_x, original_y)) - probe
+            shift = np.mean(offsets, axis=0)
+            distortion = float(np.max(np.abs(offsets - shift)))
+        except Exception as exc:
+            emit_alert(
+                f"could not verify that registration preserved the native grid: {exc}",
+                context=label,
+                dedupe_key=("registration-unresampled-error", label),
+            )
+            return
+        fractional = np.abs(shift - np.round(shift))
+        problems = []
+        if distortion > 1e-3:
+            problems.append(
+                f"pixel scale/orientation changed (up to {distortion:.3g} px across the field)"
+            )
+        if np.max(fractional) > 1e-3:
+            problems.append(
+                f"sub-pixel shift of ({fractional[0]:.3f}, {fractional[1]:.3f}) px"
+            )
+        if not problems:
+            ix, iy = (int(value) for value in np.round(shift))
+            y0, y1 = max(0, -iy), min(reg.shape[0], orig.shape[0] - iy)
+            x0, x1 = max(0, -ix), min(reg.shape[1], orig.shape[1] - ix)
+            if y1 > y0 and x1 > x0:
+                registered_values = reg[y0:y1, x0:x1].astype(float)
+                imported_values = orig[y0 + iy:y1 + iy, x0 + ix:x1 + ix].astype(float)
+                both = np.isfinite(registered_values) & np.isfinite(imported_values)
+                if np.any(both):
+                    scale = max(float(np.max(np.abs(imported_values[both]))), np.finfo(float).tiny)
+                    difference = float(
+                        np.max(np.abs(registered_values[both] - imported_values[both]))
+                    ) / scale
+                    if difference > 1e-6:
+                        problems.append(
+                            f"registered pixel values differ from the imported ones "
+                            f"(max relative difference {difference:.3g})"
+                        )
+        if problems:
+            emit_alert(
+                "registration resampled a product that must keep its native grid: "
+                + "; ".join(problems)
+                + ". Its PSF and noise-correlation metadata no longer describe the "
+                "registered image; make its field contain every other image and have "
+                "the largest pixel scale.",
+                context=label,
+                dedupe_key=("registration-unresampled", label),
+            )
+        else:
+            emit_detail(
+                f"Registration check {label}: native grid preserved "
+                f"(integer offset {int(np.round(shift[0]))}, {int(np.round(shift[1]))})"
+            )
 
     @staticmethod
     def _cleanup_successful_run(run_dir: Path, manifest_path: Path, log_path: Path) -> None:

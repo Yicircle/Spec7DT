@@ -637,6 +637,21 @@ class PointSpreadFunction:
         image_set.update_data(convolved_img, galaxy_name, observatory, band)
         if convolved_err is not None:
             image_set.update_error(convolved_err, galaxy_name, observatory, band)
+        from ..division.binning import noise_correlation_keys, strip_noise_correlation
+
+        if noise_correlation_keys(header):
+            update_header = getattr(image_set, "update_header", None)
+            if callable(update_header):
+                update_header(
+                    strip_noise_correlation(
+                        header.copy(),
+                        target_name,
+                        "the image was convolved with a PSF-matching kernel",
+                    ),
+                    galaxy_name,
+                    observatory,
+                    band,
+                )
 
         emit_detail(
             f"PSF convolution {target_name}: backend={engine.backend}, "

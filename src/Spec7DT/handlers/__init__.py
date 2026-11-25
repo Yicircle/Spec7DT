@@ -2,6 +2,7 @@ from .filter_handler import FilterCurve, Filters
 from .filter_properties import CurveProp, FilterProperties, FilterPropertyCalculator
 from .catalog_adapters import get_catalog_columns
 from . import spherex_psf as _spherex_psf
+from . import spherex_psfcommon as _spherex_psfcommon
 from .spherex_mosaic_psf import (
     SpherexMosaicPSFBuildError,
     SpherexMosaicPSFBuildResult,
